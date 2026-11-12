@@ -42,11 +42,6 @@ function Sidebar() {
       icon: LayoutDashboard,
     },
     {
-      name: "Forensics",
-      path: "/forensics",
-      icon: ScanSearch,
-    },
-    {
       name: "Reports",
       path: "/reports",
       icon: BarChart3,
