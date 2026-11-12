@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
+
+import { useEffect, useState, useCallback } from "react";
 import axios from "axios";
 import "./Devices.css";
+
 import {
   FiMonitor,
   FiHardDrive,
@@ -8,11 +10,25 @@ import {
   FiRefreshCw,
   FiWifi,
 } from "react-icons/fi";
+
 import { Link } from "react-router-dom";
+
+const API_URL =
+  import.meta.env.VITE_API_URL ||
+  "https://trustwipe-public-demo.onrender.com";
+
 function Devices() {
   const [devices, setDevices] = useState([]);
   const [loading, setLoading] = useState(false);
   const [discovering, setDiscovering] = useState(false);
+
+  const [search, setSearch] = useState("");
+
+  const [isDemoMode, setIsDemoMode] = useState(
+    !localStorage.getItem("token")
+  );
+
+  const [authError, setAuthError] = useState(false);
 
   const [form, setForm] = useState({
     deviceName: "",
@@ -25,88 +41,222 @@ function Devices() {
     location: "",
     storagePath: "",
     agentId: "",
-
   });
 
-  const [search, setSearch] = useState("");
+  // ---------------------------------
+  // AUTHENTICATION
+  // ---------------------------------
 
-  // =========================
-  // LOAD DEVICES
-  // =========================
-  const loadDevices = async () => {
-    try{
-        setLoading(true);
+  const getToken = () => localStorage.getItem("token");
 
-        const token=localStorage.getItem("token");
+  const handleExpiredToken = () => {
+    localStorage.removeItem("token");
+    setAuthError(true);
+    setIsDemoMode(true);
+    setDevices([]);
+  };
 
-        const res=await axios.get(
-            "https://trustwipe-public-demo.onrender.com/api/devices",
-            {
-                headers:{
-                    Authorization:`Bearer ${token}`
-                }
-            }
-        );
+  // ---------------------------------
+  // LOAD PUBLIC DEMO DRIVES
+  // ---------------------------------
 
-        setDevices(res.data);
+  const loadDemoDevices = useCallback(async () => {
+    try {
+      setLoading(true);
+      setDiscovering(true);
 
-    }catch(err){
-        console.log(err.response?.data||err.message);
-    }finally{
-        setLoading(false);
+      const response = await axios.get(
+        `${API_URL}/api/devices/discover`
+      );
+
+      if (
+        response.data?.success &&
+        Array.isArray(response.data.devices)
+      ) {
+        setDevices(response.data.devices);
+        setIsDemoMode(true);
+        setAuthError(false);
+      } else {
+        setDevices([]);
+      }
+    } catch (error) {
+      console.error(
+        "Demo loading error:",
+        error.response?.data || error.message
+      );
+
+      setDevices([]);
+    } finally {
+      setLoading(false);
+      setDiscovering(false);
     }
-}
-
-  useEffect(() => {
-    loadDevices();
   }, []);
 
-  // =========================
-  // MANUAL REGISTER
-  // =========================
-  const registerDevice = async () => {
-  try {
-    const token = localStorage.getItem("token");
-    console.log("API URL =", import.meta.env.VITE_API_URL);
-    await axios.post(
-      "https://trustwipe-public-demo.onrender.com/api/devices",
-      form,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
+  // ---------------------------------
+  // LOAD AUTHENTICATED REAL DEVICES
+  // ---------------------------------
+
+  const loadRealDevices = useCallback(async () => {
+    const token = getToken();
+
+    if (!token) {
+      setIsDemoMode(true);
+      await loadDemoDevices();
+      return;
+    }
+
+    try {
+      setLoading(true);
+
+      const response = await axios.get(
+        `${API_URL}/api/devices`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
+
+      const realDevices = Array.isArray(response.data)
+        ? response.data
+        : response.data?.devices || [];
+
+      // Never display simulated drives as real devices.
+      setDevices(
+        realDevices.filter(
+          (device) =>
+            !device.isDemo &&
+            !String(device.storagePath || "").startsWith("DEMO://")
+        )
+      );
+
+      setIsDemoMode(false);
+      setAuthError(false);
+    } catch (error) {
+      console.error(
+        "Real device loading error:",
+        error.response?.data || error.message
+      );
+
+      if (error.response?.status === 401) {
+        handleExpiredToken();
+        await loadDemoDevices();
       }
-    );
+    } finally {
+      setLoading(false);
+    }
+  }, [loadDemoDevices]);
 
-    setForm({
-      deviceName: "",
-      manufacturer: "",
-      modelNumber: "",
-      serialNumber: "",
-      deviceType: "",
-      storageType: "",
-      capacity: "",
-      location: "",
-      storagePath: "",
-    });
+  // ---------------------------------
+  // INITIAL LOAD
+  // ---------------------------------
 
-    loadDevices();
+  useEffect(() => {
+    if (getToken()) {
+      loadRealDevices();
+    } else {
+      loadDemoDevices();
+    }
+  }, [loadRealDevices, loadDemoDevices]);
 
-    alert("Device registered successfully");
-  } catch (err) {
-    console.log("STATUS:", err.response?.status);
-console.log("DATA:", err.response?.data);
-console.log("ERROR:", err);
-  }
-};
+  // ---------------------------------
+  // REFRESH
+  // ---------------------------------
 
-  // =========================
+  const loadDevices = () => {
+    if (getToken() && !authError) {
+      loadRealDevices();
+    } else {
+      loadDemoDevices();
+    }
+  };
+
+  // ---------------------------------
+  // MANUAL REGISTER
+  // ---------------------------------
+
+  const registerDevice = async () => {
+    if (isDemoMode) {
+      alert(
+        "Device registration is available only after logging in. Demo drives are simulated."
+      );
+      return;
+    }
+
+    const token = getToken();
+
+    if (!token) {
+      handleExpiredToken();
+      alert("Please log in to register a real device.");
+      return;
+    }
+
+    if (!form.deviceName || !form.serialNumber) {
+      alert("Please enter at least the device name and serial number.");
+      return;
+    }
+
+    try {
+      await axios.post(
+        `${API_URL}/api/devices`,
+        form,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
+
+      setForm({
+        deviceName: "",
+        manufacturer: "",
+        modelNumber: "",
+        serialNumber: "",
+        deviceType: "",
+        storageType: "",
+        capacity: "",
+        location: "",
+        storagePath: "",
+        agentId: "",
+      });
+
+      alert("Device registered successfully.");
+      loadRealDevices();
+    } catch (error) {
+      console.error(
+        "Registration error:",
+        error.response?.data || error.message
+      );
+
+      if (error.response?.status === 401) {
+        handleExpiredToken();
+        alert("Your session expired. Please log in again.");
+      } else {
+        alert(
+          error.response?.data?.message ||
+          "Device registration failed."
+        );
+      }
+    }
+  };
+
+  // ---------------------------------
   // DELETE DEVICE
-  // =========================
-  
+  // ---------------------------------
+
   const deleteDevice = async (id) => {
-  try {
-    const token = localStorage.getItem("token");
+    if (isDemoMode) {
+      alert("Simulated demo drives cannot be deleted.");
+      return;
+    }
+
+    const token = getToken();
+
+    if (!token) {
+      handleExpiredToken();
+      alert("Please log in to delete a device.");
+      return;
+    }
 
     const confirmed = window.confirm(
       "Are you sure you want to delete this device?"
@@ -114,122 +264,135 @@ console.log("ERROR:", err);
 
     if (!confirmed) return;
 
-    await axios.delete(
-      `https://trustwipe-public-demo.onrender.com/api/devices/${id}`,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
+    try {
+      await axios.delete(
+        `${API_URL}/api/devices/${id}`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
+
+      setDevices((previous) =>
+        previous.filter((device) => device._id !== id)
+      );
+
+      alert("Device deleted successfully.");
+    } catch (error) {
+      console.error(
+        "Delete error:",
+        error.response?.data || error.message
+      );
+
+      if (error.response?.status === 401) {
+        handleExpiredToken();
+        alert("Your session expired. Please log in again.");
+      } else {
+        alert("Failed to delete device.");
       }
-    );
+    }
+  };
 
-    setDevices((prev) =>
-      prev.filter((device) => device._id !== id)
-    );
+  // ---------------------------------
+  // PUBLIC DEMO DRIVE DISCOVERY
+  // ---------------------------------
 
-    alert("Device deleted successfully");
-  } catch (err) {
-    console.log(
-      "DELETE ERROR:",
-      err.response?.data || err.message
-    );
+  const runDriveDiscovery = async () => {
+    try {
+      setDiscovering(true);
 
-    alert("Failed to delete device");
-  }
-};
-  // =========================
-  // 🔥 REAL DRIVE DISCOVERY
-  // =========================
-  
-const runDriveDiscovery = async () => {
-  try {
-    setDiscovering(true);
+      const response = await axios.get(
+        `${API_URL}/api/devices/discover`
+      );
 
-    // Public demo discovery endpoint: no login token required.
-    const res = await axios.get(
-      "https://trustwipe-public-demo.onrender.com/api/devices/discover"
-    );
+      if (
+        response.data?.success &&
+        Array.isArray(response.data.devices)
+      ) {
+        setDevices(response.data.devices);
+        setIsDemoMode(true);
 
-    console.log("Discovery response:", res.data);
-
-    if (
-      res.data?.success &&
-      Array.isArray(res.data.devices) &&
-      res.data.devices.length > 0
-    ) {
-      const drive = res.data.devices[0];
-
-      setForm((prev) => ({
-        ...prev,
-        deviceName: drive.deviceName || "",
-        serialNumber: drive.serialNumber || "",
-        storageType: drive.storageType || "",
-        capacity: drive.capacity || "",
-        location: drive.location || "",
-        agentId: drive.agentId || "",
-      }));
+        alert("Simulated demo drives loaded successfully.");
+      } else {
+        alert("No demo drives found.");
+      }
+    } catch (error) {
+      console.error(
+        "Discovery error:",
+        error.response?.data || error.message
+      );
 
       alert(
-        "Drive discovered. Complete the remaining details and click Register Device."
+        error.response?.data?.message ||
+        "Demo drive discovery failed."
       );
-    } else {
-      alert("No drives found.");
+    } finally {
+      setDiscovering(false);
     }
-  } catch (err) {
-    console.error(
-      "Discovery error:",
-      err.response?.data || err.message
-    );
+  };
 
-    alert(
-      err.response?.data?.message ||
-      "Drive discovery failed. Check the backend endpoint."
-    );
-  } finally {
-    setDiscovering(false);
-  }
-};
+  // ---------------------------------
+  // SEARCH
+  // ---------------------------------
 
-  // =========================
-  // FILTER
-  // =========================
-  const filtered = devices.filter((d) => {
-    const q = search.toLowerCase();
+  const filtered = devices.filter((device) => {
+    const query = search.toLowerCase();
+
     return (
-      d.deviceName?.toLowerCase().includes(q) ||
-      d.serialNumber?.toLowerCase().includes(q)
+      device.deviceName?.toLowerCase().includes(query) ||
+      device.serialNumber?.toLowerCase().includes(query)
     );
   });
 
-  // =========================
-  // ICONS
-  // =========================
+  // ---------------------------------
+  // DEVICE ICONS
+  // ---------------------------------
+
   const getDeviceIcon = (type) => {
     switch ((type || "").toLowerCase()) {
       case "desktop":
       case "laptop":
         return <FiMonitor />;
+
       case "server":
         return <FiCpu />;
+
       case "external hdd":
       case "usb drive":
       case "hdd":
       case "ssd":
         return <FiHardDrive />;
+
       default:
         return <FiMonitor />;
     }
   };
 
+  // ---------------------------------
+  // UI
+  // ---------------------------------
+
   return (
     <div className="devices">
 
       {/* HERO */}
+
       <section className="devices-hero">
         <div className="hero-content">
           <p className="hero-label">ASSET MANAGEMENT</p>
+
           <h1>Device Command Center</h1>
-          <p>Real-time inventory + secure wipe readiness system</p>
+
+          <p>
+            Real-time inventory + secure wipe readiness system
+          </p>
+
+          {isDemoMode && (
+            <p className="demo-notice">
+              PUBLIC DEMO MODE — Displaying simulated devices only
+            </p>
+          )}
         </div>
 
         <div className="hero-card">
@@ -239,110 +402,195 @@ const runDriveDiscovery = async () => {
         </div>
       </section>
 
-      {/* ACTION BAR */}
+      {/* KPI */}
+
       <section className="kpi">
-        <div>Total <h3>{devices.length}</h3></div>
+        <div>
+          Total
+          <h3>{devices.length}</h3>
+        </div>
 
         <div className="warn">
           Pending
-          <h3>{devices.filter(d => d.status === "Pending").length}</h3>
+          <h3>
+            {devices.filter(
+              (device) => device.status === "Pending"
+            ).length}
+          </h3>
         </div>
 
         <div className="ok">
           Completed
-          <h3>{devices.filter(d => d.status === "Completed").length}</h3>
+          <h3>
+            {devices.filter(
+              (device) => device.status === "Completed"
+            ).length}
+          </h3>
         </div>
 
         <div className="info">
-          System <h3>LIVE</h3>
+          System
+          <h3>{isDemoMode ? "DEMO" : "LIVE"}</h3>
         </div>
       </section>
 
-      {/* 🔥 DRIVE DISCOVERY PANEL */}
+      {/* DISCOVERY */}
+
       <section className="panel">
         <h2>System Drive Discovery</h2>
 
-        <button className="btn" onClick={runDriveDiscovery}>
+        <button
+          className="btn"
+          onClick={runDriveDiscovery}
+          disabled={discovering}
+        >
           <FiWifi />
-          {discovering ? "Scanning system..." : "Run Drive Discovery"}
+
+          {discovering
+            ? "Loading demo drives..."
+            : "Run Drive Discovery"}
         </button>
 
-        <button className="btn" onClick={loadDevices}>
-          <FiRefreshCw /> Refresh
-        </button>
-      </section>
+        <button
+          className="btn"
+          onClick={loadDevices}
+          disabled={loading}
+        >
+          <FiRefreshCw />
 
-      {/* MANUAL REGISTER */}
-      <section className="panel">
-        <h2>Manual Device Registration</h2>
-
-        <div className="form">
-
-          <input placeholder="Device Name"
-            value={form.deviceName}
-            onChange={(e) => setForm({ ...form, deviceName: e.target.value })}
-          />
-
-          <input placeholder="Manufacturer"
-            value={form.manufacturer}
-            onChange={(e) => setForm({ ...form, manufacturer: e.target.value })}
-          />
-
-          <input placeholder="Model Number"
-            value={form.modelNumber}
-            onChange={(e) => setForm({ ...form, modelNumber: e.target.value })}
-          />
-
-          <input placeholder="Serial Number"
-            value={form.serialNumber}
-            onChange={(e) => setForm({ ...form, serialNumber: e.target.value })}
-          />
-
-          <select
-            value={form.deviceType}
-            onChange={(e) => setForm({ ...form, deviceType: e.target.value })}
-          >
-            <option value="">Device Type</option>
-            <option>Laptop</option>
-            <option>Desktop</option>
-            <option>Server</option>
-          </select>
-
-          <select
-            value={form.storageType}
-            onChange={(e) => setForm({ ...form, storageType: e.target.value })}
-          >
-            <option value="">Storage Type</option>
-            <option>HDD</option>
-            <option>SSD</option>
-            <option>NVMe</option>
-            <option>USB</option>
-          </select>
-
-          <input placeholder="Capacity (GB)"
-            value={form.capacity}
-            onChange={(e) => setForm({ ...form, capacity: e.target.value })}
-          />
-
-
-          <input placeholder="Location"
-            value={form.location}
-            onChange={(e) => setForm({ ...form, location: e.target.value })}
-          />
-
-          <input placeholder="Storage Path"
-            value={form.storagePath}
-            onChange={(e) => setForm({ ...form, storagePath: e.target.value })}
-          />
-
-        </div>
-
-        <button className="btn" onClick={registerDevice}>
-          Register Device
+          {loading ? "Refreshing..." : "Refresh"}
         </button>
       </section>
+
+      {/* MANUAL REGISTRATION */}
+
+      {!isDemoMode && (
+        <section className="panel">
+          <h2>Manual Device Registration</h2>
+
+          <div className="form">
+
+            <input
+              placeholder="Device Name"
+              value={form.deviceName}
+              onChange={(e) =>
+                setForm({
+                  ...form,
+                  deviceName: e.target.value,
+                })
+              }
+            />
+
+            <input
+              placeholder="Manufacturer"
+              value={form.manufacturer}
+              onChange={(e) =>
+                setForm({
+                  ...form,
+                  manufacturer: e.target.value,
+                })
+              }
+            />
+
+            <input
+              placeholder="Model Number"
+              value={form.modelNumber}
+              onChange={(e) =>
+                setForm({
+                  ...form,
+                  modelNumber: e.target.value,
+                })
+              }
+            />
+
+            <input
+              placeholder="Serial Number"
+              value={form.serialNumber}
+              onChange={(e) =>
+                setForm({
+                  ...form,
+                  serialNumber: e.target.value,
+                })
+              }
+            />
+
+            <select
+              value={form.deviceType}
+              onChange={(e) =>
+                setForm({
+                  ...form,
+                  deviceType: e.target.value,
+                })
+              }
+            >
+              <option value="">Device Type</option>
+              <option>Laptop</option>
+              <option>Desktop</option>
+              <option>Server</option>
+            </select>
+
+            <select
+              value={form.storageType}
+              onChange={(e) =>
+                setForm({
+                  ...form,
+                  storageType: e.target.value,
+                })
+              }
+            >
+              <option value="">Storage Type</option>
+              <option>HDD</option>
+              <option>SSD</option>
+              <option>NVMe</option>
+              <option>USB</option>
+            </select>
+
+            <input
+              placeholder="Capacity (GB)"
+              value={form.capacity}
+              onChange={(e) =>
+                setForm({
+                  ...form,
+                  capacity: e.target.value,
+                })
+              }
+            />
+
+            <input
+              placeholder="Location"
+              value={form.location}
+              onChange={(e) =>
+                setForm({
+                  ...form,
+                  location: e.target.value,
+                })
+              }
+            />
+
+            <input
+              placeholder="Storage Path"
+              value={form.storagePath}
+              onChange={(e) =>
+                setForm({
+                  ...form,
+                  storagePath: e.target.value,
+                })
+              }
+            />
+
+          </div>
+
+          <button
+            className="btn"
+            onClick={registerDevice}
+          >
+            Register Device
+          </button>
+        </section>
+      )}
 
       {/* SEARCH */}
+
       <section className="searchBox">
         <input
           placeholder="Search devices..."
@@ -352,77 +600,111 @@ const runDriveDiscovery = async () => {
       </section>
 
       {/* DEVICE GRID */}
+
+      {loading && devices.length === 0 && (
+        <p>Loading devices...</p>
+      )}
+
+      {!loading && filtered.length === 0 && (
+        <p>No devices found.</p>
+      )}
+
       <section className="grid">
 
-        {filtered.map((d) => (
-          <div className="device-card" key={d._id}>
+        {filtered.map((device) => {
+          const isDemoDevice =
+            device.isDemo === true ||
+            String(device.storagePath || "").startsWith("DEMO://");
 
-            <div className="device-header">
+          return (
+            <div
+              className="device-card"
+              key={device._id}
+            >
 
-              <div className="device-avatar">
-                {getDeviceIcon(d.deviceType)}
+              <div className="device-header">
+
+                <div className="device-avatar">
+                  {getDeviceIcon(device.deviceType)}
+                </div>
+
+                <div className="device-title">
+                  <h3>{device.deviceName}</h3>
+                  <p>{device.serialNumber}</p>
+                </div>
+
+                <span
+                  className={`status-pill ${device.status?.toLowerCase()}`}
+                >
+                  {device.status}
+                </span>
+
               </div>
 
-              <div className="device-title">
-                <h3>{d.deviceName}</h3>
-                <p>{d.serialNumber}</p>
+              <div className="device-specs">
+
+                <div className="mini-stat">
+                  <span>Storage</span>
+                  <h4>{device.storageType}</h4>
+                </div>
+
+                <div className="mini-stat">
+                  <span>Capacity</span>
+                  <h4>{device.capacity}</h4>
+                </div>
+
+                <div className="mini-stat">
+                  <span>Location</span>
+                  <h4>{device.location}</h4>
+                </div>
+
+                <div className="mini-stat">
+                  <span>Status</span>
+                  <h4>{device.status}</h4>
+                </div>
+
               </div>
 
-              <span className={`status-pill ${d.status?.toLowerCase()}`}>
-                {d.status}
-              </span>
+              <div className="device-actions">
+
+                {isDemoDevice ? (
+                  <span className="demo-device-label">
+                    SIMULATED DEVICE
+                  </span>
+                ) : (
+                  <>
+                    {device.status?.toLowerCase() === "pending" && (
+                      <Link
+                        to={`/dashboard/${device._id}`}
+                        className="details-btn"
+                      >
+                        Go to Wipe
+                      </Link>
+                    )}
+
+                    {device.status?.toLowerCase() === "completed" && (
+                      <Link
+                        to={`/dashboard/${device._id}`}
+                        className="details-btn"
+                      >
+                        Go to Verify
+                      </Link>
+                    )}
+
+                    <button
+                      className="delete-btn"
+                      onClick={() => deleteDevice(device._id)}
+                    >
+                      Delete
+                    </button>
+                  </>
+                )}
+
+              </div>
 
             </div>
-
-            <div className="device-specs">
-              <div className="mini-stat">
-                <span>Storage</span>
-                <h4>{d.storageType}</h4>
-              </div>
-
-              <div className="mini-stat">
-                <span>Capacity</span>
-                <h4>{d.capacity} </h4>
-              </div>
-
-              <div className="mini-stat">
-                <span>Location</span>
-                <h4>{d.location}</h4>
-              </div>
-
-              <div className="mini-stat">
-                <span>Status</span>
-                <h4>{d.status}</h4>
-              </div>
-            </div>
-
-<div className="device-actions">
-  {d.status?.toLowerCase() === "pending" && (
-    <Link to={`/dashboard/${d._id}`} className="details-btn">
-      Go to Wipe
-    </Link>
-  )}
-
-  {d.status?.toLowerCase() === "completed" && (
-    <Link to={`/dashboard/${d._id}`} className="details-btn">
-      Go to Verify
-    </Link>
-  )}
-
-  {/* If status is failed, don't show any action button */}
-
-  <button
-    className="delete-btn"
-    onClick={() => deleteDevice(d._id)}
-  >
-    Delete
-  </button>
-</div>
-
-
-
-          </div>
-        ))}
+          );
+        })}
 
       </section>
 
