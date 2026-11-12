@@ -40,7 +40,7 @@ function Devices() {
         const token=localStorage.getItem("token");
 
         const res=await axios.get(
-            "https://trust-wipe.onrender.com/api/devices",
+            "https://trustwipe-public-demo.onrender.com/api/devices",
             {
                 headers:{
                     Authorization:`Bearer ${token}`
@@ -69,7 +69,7 @@ function Devices() {
     const token = localStorage.getItem("token");
     console.log("API URL =", import.meta.env.VITE_API_URL);
     await axios.post(
-      "https://trust-wipe.onrender.com/api/devices",
+      "https://trustwipe-public-demo.onrender.com/api/devices",
       form,
       {
         headers: {
@@ -115,7 +115,7 @@ console.log("ERROR:", err);
     if (!confirmed) return;
 
     await axios.delete(
-      `https://trust-wipe.onrender.com/api/devices/${id}`,
+      `https://trustwipe-public-demo.onrender.com/api/devices/${id}`,
       {
         headers: {
           Authorization: `Bearer ${token}`,
@@ -140,30 +140,21 @@ console.log("ERROR:", err);
   // =========================
   // 🔥 REAL DRIVE DISCOVERY
   // =========================
-  const runDriveDiscovery = async () => {
+  
+const runDriveDiscovery = async () => {
   try {
     setDiscovering(true);
 
-    const token = localStorage.getItem("token");
-    console.log("TOKEN =", token);
+    // Public demo discovery endpoint: no login token required.
     const res = await axios.get(
-      "https://trust-wipe.onrender.com/api/devices/discover",
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      }
+      "https://trustwipe-public-demo.onrender.com/api/devices/discover"
     );
-    console.log("Discovery Response:");
-console.log(res.data);
 
-console.log("Drive:");
-console.log(res.data.devices[0]);
-    console.log(JSON.stringify(res.data, null, 2));
+    console.log("Discovery response:", res.data);
 
     if (
-      res.data.success &&
-      res.data.devices &&
+      res.data?.success &&
+      Array.isArray(res.data.devices) &&
       res.data.devices.length > 0
     ) {
       const drive = res.data.devices[0];
@@ -174,26 +165,31 @@ console.log(res.data.devices[0]);
         serialNumber: drive.serialNumber || "",
         storageType: drive.storageType || "",
         capacity: drive.capacity || "",
-        location: "",
+        location: drive.location || "",
         agentId: drive.agentId || "",
       }));
 
       alert(
-        "Drive discovered. Please complete the remaining details and click Register Device."
+        "Drive discovered. Complete the remaining details and click Register Device."
       );
     } else {
-      alert("No drives found");
+      alert("No drives found.");
     }
-
   } catch (err) {
-    console.log(
-      "DISCOVERY ERROR:",
+    console.error(
+      "Discovery error:",
       err.response?.data || err.message
+    );
+
+    alert(
+      err.response?.data?.message ||
+      "Drive discovery failed. Check the backend endpoint."
     );
   } finally {
     setDiscovering(false);
   }
 };
+
   // =========================
   // FILTER
   // =========================

@@ -2,13 +2,18 @@
 import express from "express";
 
 import {
-  autoDiscoverDevices,
   getDevices,
   createDevice,
   deleteDevice,
 } from "../controllers/deviceController.js";
 
-import { discoverDrives } from "../services/driveDiscovery.js";
+import {
+  discoverDemoDrives,
+} from "../controllers/demoDeviceController.js";
+
+import {
+  discoverDrives,
+} from "../services/driveDiscovery.js";
 
 import authMiddleware from "../middleware/authMiddleware.js";
 
@@ -18,33 +23,39 @@ const router = express.Router();
 |--------------------------------------------------------------------------
 | TEST ROUTE
 |--------------------------------------------------------------------------
-| Temporary route to verify that deviceRoutes.js is correctly mounted
-| on the Render backend.
-|
-| URL:
 | GET /api/devices/test-drive-route
-|
-| Remove this route after deployment testing.
 |--------------------------------------------------------------------------
 */
 router.get("/test-drive-route", (_req, res) => {
-  return res.json({
+  return res.status(200).json({
     success: true,
-    message: "Device route is mounted correctly",
+    message: "Device routes mounted correctly",
   });
 });
 
 /*
 |--------------------------------------------------------------------------
-| AUTO DISCOVER DEVICES
+| PUBLIC DEMO DRIVE DISCOVERY
 |--------------------------------------------------------------------------
-| Discovers available devices through the TrustWipe Agent.
-|
 | GET /api/devices/discover
+|
+| No login required.
+| Must use a dedicated, isolated demo agent.
+|--------------------------------------------------------------------------
+*/
+router.get("/discover", discoverDemoDrives);
+
+/*
+|--------------------------------------------------------------------------
+| AUTHENTICATED DRIVE DISCOVERY
+|--------------------------------------------------------------------------
+| GET /api/devices/discover/private
+|
+| Discovers drives through the authenticated user's agent.
 |--------------------------------------------------------------------------
 */
 router.get(
-  "/discover",
+  "/discover/private",
   authMiddleware,
   discoverDrives
 );
@@ -53,9 +64,8 @@ router.get(
 |--------------------------------------------------------------------------
 | CREATE DEVICE
 |--------------------------------------------------------------------------
-| Creates/registers a device in the database.
-|
 | POST /api/devices
+| Authentication required.
 |--------------------------------------------------------------------------
 */
 router.post(
@@ -68,9 +78,8 @@ router.post(
 |--------------------------------------------------------------------------
 | DELETE DEVICE
 |--------------------------------------------------------------------------
-| Deletes a registered device.
-|
 | DELETE /api/devices/:id
+| Authentication required.
 |--------------------------------------------------------------------------
 */
 router.delete(
@@ -83,9 +92,8 @@ router.delete(
 |--------------------------------------------------------------------------
 | GET ALL DEVICES
 |--------------------------------------------------------------------------
-| Returns all devices available to the authenticated user.
-|
 | GET /api/devices
+| Authentication required.
 |--------------------------------------------------------------------------
 */
 router.get(
@@ -93,22 +101,13 @@ router.get(
   authMiddleware,
   getDevices
 );
-router.get("/test-drive-route", (_req, res) => {
-  return res.json({
-    success: true,
-    message: "Device route is mounted correctly",
-  });
-});
+
 /*
 |--------------------------------------------------------------------------
-| GET DRIVES FROM SPECIFIC AGENT
+| GET DRIVES FROM A SPECIFIC AGENT
 |--------------------------------------------------------------------------
-| Requests the connected TrustWipe Agent to discover physical drives.
-|
 | GET /api/devices/:agentId/drives
-|
-| Example:
-| /api/devices/MahalakshmiSreenivasan/drives
+| Authentication required.
 |--------------------------------------------------------------------------
 */
 router.get(
@@ -120,7 +119,6 @@ router.get(
         req.params.agentId || ""
       ).trim();
 
-      // Validate Agent ID
       if (!agentId) {
         return res.status(400).json({
           success: false,
@@ -129,50 +127,22 @@ router.get(
         });
       }
 
-      console.log(
-        `📀 Drive discovery requested for Agent: ${agentId}`
-      );
-
-      /*
-      |--------------------------------------------------------------------------
-      | Get Agent Bridge
-      |--------------------------------------------------------------------------
-      | server.js should contain:
-      |
-      | app.set("agentBridge", agentBridge);
-      |--------------------------------------------------------------------------
-      */
       const agentBridge = req.app.get("agentBridge");
 
       if (
         !agentBridge ||
         typeof agentBridge.requestDriveList !== "function"
       ) {
-        console.error(
-          "❌ Agent bridge unavailable"
-        );
-
         return res.status(503).json({
           success: false,
           code: "AGENT_BRIDGE_UNAVAILABLE",
-          message:
-            "TrustWipe Agent bridge is unavailable.",
+          message: "TrustWipe Agent bridge is unavailable.",
         });
       }
 
-      /*
-      |--------------------------------------------------------------------------
-      | Request drive list from Agent
-      |--------------------------------------------------------------------------
-      */
-      const data =
-        await agentBridge.requestDriveList(
-          agentId,
-          req.user?.id || null
-        );
-
-      console.log(
-        `✅ Drive list received for Agent: ${agentId}`
+      const data = await agentBridge.requestDriveList(
+        agentId,
+        req.user.id
       );
 
       const drives = Array.isArray(data?.drives)
@@ -187,34 +157,20 @@ router.get(
 
     } catch (error) {
       console.error(
-        "❌ Drive discovery error:",
+        "Agent drive discovery error:",
         error
       );
 
-      /*
-      |--------------------------------------------------------------------------
-      | Error mapping
-      |--------------------------------------------------------------------------
-      */
-      let status = 500;
-
-      if (error.code === "AGENT_NOT_FOUND") {
-        status = 404;
-      } else if (
-        error.code === "AGENT_OFFLINE"
-      ) {
-        status = 503;
-      } else if (
-        error.code === "DRIVE_DISCOVERY_TIMEOUT"
-      ) {
-        status = 504;
-      }
+      const status = {
+        AGENT_NOT_FOUND: 404,
+        AGENT_OFFLINE: 503,
+        DRIVE_DISCOVERY_TIMEOUT: 504,
+      }[error.code] || 500;
 
       return res.status(status).json({
         success: false,
         code:
-          error.code ||
-          "DRIVE_DISCOVERY_ERROR",
+          error.code || "DRIVE_DISCOVERY_ERROR",
         message:
           error.message ||
           "Unable to discover drives.",
@@ -223,9 +179,4 @@ router.get(
   }
 );
 
-/*
-|--------------------------------------------------------------------------
-| EXPORT ROUTER
-|--------------------------------------------------------------------------
-*/
 export default router;

@@ -12,7 +12,7 @@ function WipeJobs() {
     console.log("POST Token:", token);
 
     const res = await axios.post(
-      "https://trust-wipe.onrender.com/api/wipe/start",
+      "https://trustwipe-public-demo.onrender.com/api/wipe/start",
       { deviceId },
       {
         headers: {

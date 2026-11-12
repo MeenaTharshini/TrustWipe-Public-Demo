@@ -32,7 +32,7 @@ function Dashboard() {
     const token = localStorage.getItem("token");
 
     const res = await axios.get(
-      "https://trust-wipe.onrender.com/api/devices",
+      "https://trustwipe-public-demo.onrender.com/api/devices",
       {
         headers: {
           Authorization: `Bearer ${token}`,
@@ -54,7 +54,7 @@ function Dashboard() {
     const token = localStorage.getItem("token");
 
     const res = await axios.get(
-      "https://trust-wipe.onrender.com/api/wipe/latest",
+      "https://trustwipe-public-demo.onrender.com/api/wipe/latest",
       {
         headers: { Authorization: `Bearer ${token}` },
       }
@@ -131,7 +131,7 @@ const [latestJob, setLatestJob] = useState(null);
 };
   const downloadAgent = () => {
   window.open(
-    "https://trust-wipe.onrender.com/downloads/TrustWipeAgent.exe",
+    "https://trustwipe-public-demo.onrender.com/downloads/TrustWipeAgent.exe",
     "_blank"
   );
 
@@ -151,7 +151,7 @@ const [latestJob, setLatestJob] = useState(null);
     console.log("POST Token:", token);
 
     const res = await axios.post(
-      "https://trust-wipe.onrender.com/api/wipe/start",
+      "https://trustwipe-public-demo.onrender.com/api/wipe/start",
       { deviceId },
       {
         headers: {

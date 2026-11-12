@@ -42,7 +42,7 @@ function VerifyCertificate() {
       setCert(null);
 
       const res = await axios.get(
-        `https://trust-wipe.onrender.com/api/certificate/verify/${finalId}`
+        `https://trustwipe-public-demo.onrender.com/api/certificate/verify/${finalId}`
       );
 
       const data = res.data;

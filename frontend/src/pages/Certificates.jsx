@@ -28,7 +28,7 @@ function Certificates() {
         const token = localStorage.getItem("token");
 
 const res = await axios.get(
-  `https://trust-wipe.onrender.com/api/certificate/verify/${id}`,
+  `https://trustwipe-public-demo.onrender.com/api/certificate/verify/${id}`,
   {
     headers: {
       Authorization: `Bearer ${token}`,

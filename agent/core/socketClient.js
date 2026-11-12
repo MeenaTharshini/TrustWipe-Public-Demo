@@ -25,7 +25,7 @@ dotenv.config();
 
 const SERVER_URL =
   process.env.SERVER_URL ||
-  "https://trust-wipe-forensic-recovery-glwn.onrender.com";
+  "https://trustwipe-public-demo.onrender.com";
 
 
 /* =====================================================

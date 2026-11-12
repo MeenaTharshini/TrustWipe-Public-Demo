@@ -56,7 +56,7 @@ export default function Login() {
       setLoading(true);
 
       const response = await fetch(
-        "https://trust-wipe.onrender.com/api/auth/login",
+        "https://trustwipe-public-demo.onrender.com/api/auth/login",
         {
           method: "POST",
           headers: {

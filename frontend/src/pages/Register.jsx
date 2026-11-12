@@ -82,7 +82,7 @@ export default function Register() {
 
       const response =
         await fetch(
-          "https://trust-wipe.onrender.com/api/auth/register",
+          "https://trustwipe-public-demo.onrender.com/api/auth/register",
           {
             method: "POST",
             headers: {

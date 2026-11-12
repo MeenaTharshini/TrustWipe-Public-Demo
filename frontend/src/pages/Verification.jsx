@@ -36,7 +36,7 @@ function Verification() {
       setLoading(true);
 
       const res = await axios.post(
-        "https://trust-wipe.onrender.com/api/verification/verify",
+        "https://trustwipe-public-demo.onrender.com/api/verification/verify",
          { jobId }, 
       );
 
