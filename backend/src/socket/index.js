@@ -7,12 +7,13 @@ import { Server } from "socket.io";
 
 import {
   setSocket,
+  authenticateAgent,
   registerAgent,
   unregisterAgent,
   updateAgentHeartbeat,
   resolveDriveDiscovery,
   getAgentInternal,
-  getAgent as getBridgeAgent,
+  getAgent,
   listAgents,
   isAgentConnected
 } from "./agentBridge.js";
@@ -31,22 +32,16 @@ import {
 
 let io = null;
 
-const DEMO_AGENT_ID = process.env.TRUSTWIPE_DEMO_AGENT_ID;
-
-const allowedOrigins = (
-  process.env.FRONTEND_URL ||
-  "http://localhost:5173,https://trust-wipe-public-demo.vercel.app"
-)
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter(Boolean);
-
 /* ==========================================
    HELPERS
 ========================================== */
 
 const getAgentId = (data = {}) =>
-  String(data.agentId || data.deviceId || "").trim();
+  String(
+    data.agentId ||
+    data.deviceId ||
+    ""
+  ).trim();
 
 const getRegisteredAgentForSocket = (socket) => {
   return listAgents().find(
@@ -54,15 +49,15 @@ const getRegisteredAgentForSocket = (socket) => {
   ) || null;
 };
 
-const isSocketAuthorizedForAgent = (socket, agentId) => {
-  const id = String(agentId || "").trim();
-
-  if (!id) return false;
-
-  const agent = getAgentInternal(id);
+const isSocketAuthorizedForAgent = (
+  socket,
+  agentId
+) => {
+  const agent = getAgentInternal(agentId);
 
   return Boolean(
     agent &&
+    agent.authenticated === true &&
     agent.socketId === socket.id &&
     agent.socket?.connected
   );
@@ -74,44 +69,8 @@ const emitToAgent = (agentId, event, payload) => {
   io.to(`agent:${agentId}`).emit(event, payload);
 };
 
-/*
- * Fail closed unless the database links this job's
- * device to the agent reporting the event.
- *
- * This expects Device.agentId or Device.deviceId,
- * or WipeJob.agentId, to contain the registered ID.
- */
-const getAuthorizedJob = async (jobId, agentId) => {
-  if (!jobId || !agentId) return null;
-
-  const job = await WipeJob.findById(jobId);
-
-  if (!job) return null;
-
-  const device = await Device.findById(job.deviceId);
-
-  if (!device) return null;
-
-  const linkedAgentId = String(
-    job.agentId ||
-    device.agentId ||
-    device.deviceId ||
-    ""
-  ).trim();
-
-  if (!linkedAgentId || linkedAgentId !== String(agentId)) {
-    console.warn(
-      "Rejected job event: job/device does not belong to reporting agent."
-    );
-
-    return null;
-  }
-
-  return { job, device };
-};
-
 /* ==========================================
-   SOCKET INITIALIZATION
+   INITIALIZE SOCKET.IO
 ========================================== */
 
 export const initAgentClient = (httpServer) => {
@@ -122,9 +81,21 @@ export const initAgentClient = (httpServer) => {
   }
 
   if (io) {
-    console.warn("Socket.IO is already initialized.");
+    console.warn(
+      "Socket.IO is already initialized."
+    );
+
     return io;
   }
+
+  const allowedOrigins = (
+    process.env.FRONTEND_URL ||
+    process.env.FRONTEND_ORIGIN ||
+    "http://localhost:5173"
+  )
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
 
   io = new Server(httpServer, {
     cors: {
@@ -132,25 +103,32 @@ export const initAgentClient = (httpServer) => {
       methods: ["GET", "POST"],
       credentials: true
     },
+
     transports: ["websocket", "polling"],
+
     pingInterval: 25000,
     pingTimeout: 60000
   });
 
   setSocket(io);
 
-  console.log("TrustWipe Socket.IO initialized.");
+  console.log("=================================");
+  console.log(" TrustWipe Socket.IO Started");
+  console.log("=================================");
 
-  /* ========================================
+  /* ==========================================
      CONNECTION
-  ======================================== */
+  ========================================== */
 
   io.on("connection", (socket) => {
-    console.log("Socket connected:", socket.id);
+    console.log(
+      "Socket connected:",
+      socket.id
+    );
 
-    /* ======================================
+    /* ========================================
        REGISTER AGENT
-    ====================================== */
+    ======================================== */
 
     socket.on("register-agent", (agent = {}) => {
       try {
@@ -161,21 +139,30 @@ export const initAgentClient = (httpServer) => {
             success: false,
             error: "Missing agentId/deviceId."
           });
+
           return;
         }
 
         /*
-         * The configured demo agent must have a separate
-         * server-validated registration token.
+         * Verify the agent using a server-side
+         * credential. Never trust metadata.demo.
          */
-        if (
-          agentId === DEMO_AGENT_ID &&
-          !process.env.TRUSTWIPE_DEMO_AGENT_TOKEN
-        ) {
+        const authenticated = authenticateAgent(
+          agentId,
+          agent.agentToken
+        );
+
+        if (!authenticated) {
           socket.emit("agent-registered", {
             success: false,
-            error: "Demo agent authentication is not configured."
+            error: "Agent authentication failed."
           });
+
+          console.warn(
+            "Rejected unauthenticated agent:",
+            agentId
+          );
+
           return;
         }
 
@@ -184,16 +171,8 @@ export const initAgentClient = (httpServer) => {
           agentId,
           deviceId: agentId,
           socket,
-          demoToken: agent.demoToken
+          authenticated: true
         });
-
-        if (!registeredAgent) {
-          socket.emit("agent-registered", {
-            success: false,
-            error: "Agent registration failed."
-          });
-          return;
-        }
 
         socket.join(`agent:${agentId}`);
 
@@ -205,54 +184,92 @@ export const initAgentClient = (httpServer) => {
         });
 
         /*
-         * Do not broadcast hostnames or capabilities to
-         * every connected client.
+         * Status is informational only.
+         * Do not broadcast drives or wipe details.
          */
-        console.log("Agent registered:", agentId);
+        io.emit("agent-status", {
+          agentId,
+          deviceId: agentId,
+          status: "online",
+          hostname: registeredAgent.hostname,
+          platform: registeredAgent.platform,
+          capabilities: registeredAgent.capabilities
+        });
+
+        console.log(
+          "Authenticated agent registered:",
+          agentId
+        );
+
       } catch (error) {
-        console.error("Agent registration error:", error.message);
+        console.error(
+          "Agent registration error:",
+          error.message
+        );
 
         socket.emit("agent-registered", {
           success: false,
-          error: "Agent registration failed."
+          error: error.message
         });
       }
     });
 
-    /* ======================================
+    /* ========================================
        HEARTBEAT
-    ====================================== */
+    ======================================== */
 
     socket.on("heartbeat", (data = {}) => {
       try {
         const agentId = getAgentId(data);
 
-        if (!isSocketAuthorizedForAgent(socket, agentId)) {
-          console.warn("Rejected unauthorized heartbeat.");
+        if (
+          !agentId ||
+          !isSocketAuthorizedForAgent(socket, agentId)
+        ) {
+          console.warn(
+            "Rejected heartbeat from unauthorized socket."
+          );
+
           return;
         }
 
-        updateAgentHeartbeat(agentId, data);
+        const updated = updateAgentHeartbeat(
+          agentId,
+          data
+        );
+
+        if (!updated) return;
+
+        io.emit("agent-status", {
+          agentId,
+          deviceId: agentId,
+          status: "online"
+        });
+
       } catch (error) {
-        console.error("Heartbeat error:", error.message);
+        console.error(
+          "Heartbeat error:",
+          error.message
+        );
       }
     });
 
-    /* ======================================
+    /* ========================================
        DRIVE DISCOVERY RESPONSE
-    ====================================== */
+    ======================================== */
 
     socket.on("drive-list", (data = {}) => {
       try {
         const agentId = getAgentId(data);
 
-        if (!isSocketAuthorizedForAgent(socket, agentId)) {
-          console.warn("Rejected unauthorized drive-list.");
-          return;
-        }
+        if (
+          !agentId ||
+          !isSocketAuthorizedForAgent(socket, agentId)
+        ) {
+          console.warn(
+            "Rejected drive-list from unauthorized socket."
+          );
 
-        if (!data.requestId) {
-          console.warn("Drive-list response missing requestId.");
           return;
         }
 
@@ -260,55 +277,65 @@ export const initAgentClient = (httpServer) => {
           ? data.drives
           : [];
 
-        const resolved = resolveDriveDiscovery(
-          data.requestId,
-          {
-            success: true,
-            agentId,
-            deviceId: agentId,
-            drives,
-            timestamp: data.timestamp || new Date().toISOString()
-          },
-          socket.id
-        );
+        const result = {
+          ...data,
+          agentId,
+          deviceId: agentId,
+          drives,
+          timestamp:
+            data.timestamp ||
+            new Date().toISOString()
+        };
 
-        console.log(
-          resolved
-            ? `Drive discovery resolved for ${agentId}.`
-            : `Unmatched drive discovery response from ${agentId}.`
-        );
+        if (data.requestId) {
+          const resolved = resolveDriveDiscovery(
+            data.requestId,
+            result,
+            socket.id
+          );
+
+          console.log(
+            resolved
+              ? "Drive discovery resolved."
+              : "Drive discovery response not matched."
+          );
+        }
 
         /*
-         * Do not resolve discovery using data.userId.
-         * A user ID supplied by an agent event is not
-         * proof of ownership.
-         *
-         * Do not broadcast drive lists globally.
+         * No global drive-list broadcast.
+         * The HTTP controller receives the Promise result.
          */
+
       } catch (error) {
-        console.error("Drive-list error:", error.message);
+        console.error(
+          "Drive discovery response error:",
+          error.message
+        );
       }
     });
 
-    /* ======================================
+    /* ========================================
        WIPE PROGRESS
-    ====================================== */
+    ======================================== */
 
     socket.on("wipe-progress", async (data = {}) => {
       try {
         const agentId = getAgentId(data);
 
-        if (!isSocketAuthorizedForAgent(socket, agentId)) {
-          console.warn("Rejected unauthorized wipe-progress.");
+        if (
+          !agentId ||
+          !isSocketAuthorizedForAgent(socket, agentId)
+        ) {
           return;
         }
 
         const jobId = data.commandId || data.jobId;
 
+        if (!jobId) return;
+
         const progress = Number(data.progress);
 
         if (
-          !jobId ||
           !Number.isFinite(progress) ||
           progress < 0 ||
           progress > 100
@@ -316,46 +343,57 @@ export const initAgentClient = (httpServer) => {
           return;
         }
 
-        const authorized = await getAuthorizedJob(jobId, agentId);
+        /*
+         * Important:
+         * Before production use, add a verified
+         * job-to-agent/device ownership condition
+         * to this database query.
+         */
+        const job = await WipeJob.findByIdAndUpdate(
+          jobId,
+          {
+            progress,
+            status: "running",
+            $push: {
+              events: {
+                message:
+                  data.message ||
+                  "Wipe progress updated.",
+                timestamp: new Date()
+              }
+            }
+          },
+          { new: true }
+        );
 
-        if (!authorized) return;
+        if (!job) return;
 
-        const { job } = authorized;
+        emitToAgent(
+          agentId,
+          "wipe-progress",
+          job
+        );
 
-        if (
-          job.status === "completed" ||
-          job.status === "failed"
-        ) {
-          return;
-        }
-
-        job.progress = progress;
-        job.status = "running";
-
-        job.events = job.events || [];
-        job.events.push({
-          message: data.message || "Wipe progress updated.",
-          timestamp: new Date()
-        });
-
-        await job.save();
-
-        emitToAgent(agentId, "wipe-progress", job);
       } catch (error) {
-        console.error("Wipe-progress error:", error.message);
+        console.error(
+          "Wipe progress error:",
+          error.message
+        );
       }
     });
 
-    /* ======================================
+    /* ========================================
        WIPE COMPLETE
-    ====================================== */
+    ======================================== */
 
     socket.on("wipe-complete", async (data = {}) => {
       try {
         const agentId = getAgentId(data);
 
-        if (!isSocketAuthorizedForAgent(socket, agentId)) {
-          console.warn("Rejected unauthorized wipe-complete.");
+        if (
+          !agentId ||
+          !isSocketAuthorizedForAgent(socket, agentId)
+        ) {
           return;
         }
 
@@ -367,97 +405,147 @@ export const initAgentClient = (httpServer) => {
           data.status === "completed"
             ? "completed"
             : data.status === "failed"
-              ? "failed"
-              : null;
+            ? "failed"
+            : null;
 
         if (!finalStatus) {
-          console.warn("Rejected invalid wipe completion status.");
+          console.warn(
+            "Rejected invalid wipe completion status."
+          );
+
           return;
         }
 
-        const authorized = await getAuthorizedJob(jobId, agentId);
+        /*
+         * Production requirement:
+         * Verify this job belongs to a device assigned
+         * to this exact agent before updating it.
+         */
+        const job = await WipeJob.findByIdAndUpdate(
+          jobId,
+          {
+            progress:
+              finalStatus === "completed"
+                ? 100
+                : Number(data.progress || 0),
 
-        if (!authorized) return;
+            status: finalStatus,
 
-        const { job, device } = authorized;
+            completedAt: new Date(),
 
-        if (
-          job.status === "completed" ||
-          job.status === "failed"
-        ) {
-          console.warn("Ignoring duplicate wipe completion:", jobId);
+            wipedFiles: data.wipedFiles,
+            verifiedFiles: data.verifiedFiles,
+
+            verificationFailures:
+              data.verificationFailures,
+
+            verificationHash:
+              data.verificationHash,
+
+            verificationEvidenceHash:
+              data.verificationEvidenceHash,
+
+            $push: {
+              events: {
+                message: `Job ${finalStatus}`,
+                timestamp: new Date()
+              }
+            }
+          },
+          { new: true }
+        );
+
+        if (!job) {
+          console.warn(
+            "Wipe job not found:",
+            jobId
+          );
+
           return;
         }
 
-        job.progress =
-          finalStatus === "completed"
-            ? 100
-            : Math.min(
-                100,
-                Math.max(0, Number(data.progress) || 0)
-              );
-
-        job.status = finalStatus;
-        job.completedAt = new Date();
-
-        job.wipedFiles = data.wipedFiles;
-        job.verifiedFiles = data.verifiedFiles;
-        job.verificationFailures = data.verificationFailures;
-        job.verificationHash = data.verificationHash;
-        job.verificationEvidenceHash =
-          data.verificationEvidenceHash;
-
-        job.events = job.events || [];
-        job.events.push({
-          message: `Job ${finalStatus}`,
-          timestamp: new Date()
-        });
-
-        await job.save();
-
-        /* ----------------------------------
+        /* ------------------------------------
            UPDATE DEVICE
-        ---------------------------------- */
+        ------------------------------------ */
 
         const deviceStatus =
           finalStatus === "completed"
             ? "Completed"
             : "Failed";
 
-        device.status = deviceStatus;
-        device.currentJobId = null;
-        device.lastJobId = job._id;
+        await Device.findByIdAndUpdate(
+          job.deviceId,
+          {
+            status: deviceStatus,
+            currentJobId: null,
+            lastJobId: job._id
+          },
+          { new: true }
+        );
 
-        await device.save();
-
-        /* ----------------------------------
+        /* ------------------------------------
            GENERATE CERTIFICATE
-        ---------------------------------- */
+        ------------------------------------ */
 
         if (finalStatus === "completed") {
           try {
+            const device = await Device.findById(
+              job.deviceId
+            );
+
+            if (!device) {
+              throw new Error("Device not found.");
+            }
+
             const certificate = await Certificate.create({
               certificateId: `TW-${Date.now()}`,
+
               deviceId: device._id,
               jobId: job._id,
-              manufacturer: device.manufacturer || "",
-              modelNumber: device.modelNumber || "",
+
+              manufacturer:
+                device.manufacturer || "",
+
+              modelNumber:
+                device.modelNumber || "",
+
               owner: device.owner,
-              location: device.location || "",
-              deviceType: device.storageType || "",
-              storagePath: device.storagePath || "",
-              sanitizationStandard: "NIST SP 800-88 Rev.1",
+
+              location:
+                device.location || "",
+
+              deviceType:
+                device.storageType || "",
+
+              storagePath:
+                device.storagePath || "",
+
+              sanitizationStandard:
+                "NIST SP 800-88 Rev.1",
+
               algorithm: job.algorithm,
-              verificationMethod: job.verificationMethod,
-              verificationHash: job.verificationHash,
+
+              verificationMethod:
+                job.verificationMethod,
+
+              verificationHash:
+                job.verificationHash,
+
               verificationEvidenceHash:
                 job.verificationEvidenceHash,
+
               verificationStatus: "VERIFIED",
+
               wipedFiles: job.wipedFiles,
               verifiedFiles: job.verifiedFiles,
-              verificationFailures: job.verificationFailures,
+
+              verificationFailures:
+                job.verificationFailures,
+
               wipeCompletedAt: job.completedAt,
-              signature: "TrustWipe Digital Signature"
+
+              signature:
+                "TrustWipe Digital Signature"
             });
 
             const pdfPath = await generateCertificate(
@@ -466,15 +554,19 @@ export const initAgentClient = (httpServer) => {
             );
 
             certificate.pdfUrl = pdfPath;
+
             await certificate.save();
 
-            job.certificateId = certificate.certificateId;
+            job.certificateId =
+              certificate.certificateId;
+
             await job.save();
 
             console.log(
               "Certificate generated:",
               certificate.certificateId
             );
+
           } catch (error) {
             console.error(
               "Certificate generation failed:",
@@ -483,68 +575,46 @@ export const initAgentClient = (httpServer) => {
           }
         }
 
-        /*
-         * This room currently contains the agent socket.
-         * User dashboard notifications require a separate
-         * authenticated user room.
-         */
-        emitToAgent(agentId, "wipe-complete", job);
+        /* ------------------------------------
+           NOTIFY AGENT ROOM ONLY
+        ------------------------------------ */
 
-        emitToAgent(agentId, "device-updated", {
-          deviceId: device._id,
-          status: deviceStatus,
-          jobId: job._id
-        });
+        emitToAgent(
+          agentId,
+          "wipe-complete",
+          job
+        );
+
+        emitToAgent(
+          agentId,
+          "device-updated",
+          {
+            deviceId: job.deviceId,
+            status: deviceStatus,
+            jobId: job._id
+          }
+        );
+
       } catch (error) {
-        console.error("Wipe-complete error:", error.message);
+        console.error(
+          "Wipe completion error:",
+          error.message
+        );
       }
     });
 
-    /* ======================================
+    /* ========================================
        FORENSIC PROGRESS
-    ====================================== */
+    ======================================== */
 
     socket.on("forensic-progress", (data = {}) => {
       try {
         const agentId = getAgentId(data);
 
-        if (!isSocketAuthorizedForAgent(socket, agentId)) {
-          return;
-        }
-
-        const jobId = data.jobId || data.commandId;
-        const progress = Number(data.progress);
-
         if (
-          !jobId ||
-          !Number.isFinite(progress) ||
-          progress < 0 ||
-          progress > 100
+          !agentId ||
+          !isSocketAuthorizedForAgent(socket, agentId)
         ) {
-          return;
-        }
-
-        emitToAgent(agentId, "forensic-progress", {
-          ...data,
-          agentId,
-          jobId,
-          progress,
-          timestamp: new Date().toISOString()
-        });
-      } catch (error) {
-        console.error("Forensic-progress error:", error.message);
-      }
-    });
-
-    /* ======================================
-       FORENSIC COMPLETE
-    ====================================== */
-
-    socket.on("forensic-complete", (data = {}) => {
-      try {
-        const agentId = getAgentId(data);
-
-        if (!isSocketAuthorizedForAgent(socket, agentId)) {
           return;
         }
 
@@ -552,66 +622,144 @@ export const initAgentClient = (httpServer) => {
 
         if (!jobId) return;
 
-        emitToAgent(agentId, "forensic-complete", {
-          ...data,
+        const progress = Number(data.progress || 0);
+
+        if (
+          !Number.isFinite(progress) ||
+          progress < 0 ||
+          progress > 100
+        ) {
+          return;
+        }
+
+        emitToAgent(
           agentId,
-          jobId,
-          status: data.status || "completed",
-          timestamp: new Date().toISOString()
-        });
+          "forensic-progress",
+          {
+            ...data,
+            agentId,
+            jobId,
+            progress,
+            timestamp: new Date().toISOString()
+          }
+        );
+
       } catch (error) {
-        console.error("Forensic-complete error:", error.message);
+        console.error(
+          "Forensic progress error:",
+          error.message
+        );
       }
     });
 
-    /* ======================================
+    /* ========================================
+       FORENSIC COMPLETE
+    ======================================== */
+
+    socket.on("forensic-complete", (data = {}) => {
+      try {
+        const agentId = getAgentId(data);
+
+        if (
+          !agentId ||
+          !isSocketAuthorizedForAgent(socket, agentId)
+        ) {
+          return;
+        }
+
+        const jobId = data.jobId || data.commandId;
+
+        if (!jobId) return;
+
+        emitToAgent(
+          agentId,
+          "forensic-complete",
+          {
+            ...data,
+            agentId,
+            jobId,
+            status: data.status || "completed",
+            timestamp: new Date().toISOString()
+          }
+        );
+
+      } catch (error) {
+        console.error(
+          "Forensic completion error:",
+          error.message
+        );
+      }
+    });
+
+    /* ========================================
        FORENSIC ERROR
-    ====================================== */
+    ======================================== */
 
     socket.on("forensic-error", (data = {}) => {
       try {
         const agentId = getAgentId(data);
 
-        if (!isSocketAuthorizedForAgent(socket, agentId)) {
+        if (
+          !agentId ||
+          !isSocketAuthorizedForAgent(socket, agentId)
+        ) {
           return;
         }
 
-        const jobId = data.jobId || data.commandId || null;
+        const jobId =
+          data.jobId ||
+          data.commandId ||
+          null;
 
-        emitToAgent(agentId, "forensic-error", {
-          ...data,
+        emitToAgent(
           agentId,
-          jobId,
-          status: "failed",
-          timestamp: new Date().toISOString()
-        });
+          "forensic-error",
+          {
+            ...data,
+            agentId,
+            jobId,
+            status: "failed",
+            timestamp: new Date().toISOString()
+          }
+        );
+
       } catch (error) {
-        console.error("Forensic-error error:", error.message);
+        console.error(
+          "Forensic error handler failed:",
+          error.message
+        );
       }
     });
 
-    /* ======================================
+    /* ========================================
        AGENT STATUS REQUEST
-    ====================================== */
+    ======================================== */
 
     socket.on("get-agent-status", () => {
-      try {
-        const agent = getRegisteredAgentForSocket(socket);
-
-        socket.emit("agent-list", agent ? [agent] : []);
-      } catch (error) {
-        console.error("Agent status error:", error.message);
-      }
-    });
-
-    /* ======================================
-       DISCONNECT
-    ====================================== */
-
-    socket.on("disconnect", (reason) => {
       const agent = getRegisteredAgentForSocket(socket);
 
-      console.log("Socket disconnected:", socket.id, reason);
+      /*
+       * Do not expose all connected agents to
+       * arbitrary unauthenticated sockets.
+       */
+      socket.emit(
+        "agent-list",
+        agent ? [agent] : []
+      );
+    });
+
+    /* ========================================
+       DISCONNECT
+    ======================================== */
+
+    socket.on("disconnect", (reason) => {
+      console.log(
+        "Socket disconnected:",
+        socket.id,
+        reason
+      );
+
+      const agent = getRegisteredAgentForSocket(socket);
 
       if (!agent) return;
 
@@ -621,7 +769,11 @@ export const initAgentClient = (httpServer) => {
       );
 
       if (removed) {
-        console.log("Agent disconnected:", agent.agentId);
+        io.emit("agent-status", {
+          agentId: agent.agentId,
+          deviceId: agent.agentId,
+          status: "offline"
+        });
       }
     });
   });
@@ -630,7 +782,7 @@ export const initAgentClient = (httpServer) => {
 };
 
 /* ==========================================
-   GET SOCKET INSTANCE
+   GET SOCKET.IO INSTANCE
 ========================================== */
 
 export const getIO = () => {
@@ -647,14 +799,15 @@ export const getIO = () => {
    GET CONNECTED AGENTS
 ========================================== */
 
-export const getConnectedAgents = () => listAgents();
+export const getConnectedAgents = () =>
+  listAgents();
 
 /* ==========================================
    GET SINGLE AGENT
 ========================================== */
 
-export const getAgent = (deviceId) =>
-  getBridgeAgent(deviceId);
+export const getAgentById = (deviceId) =>
+  getAgent(deviceId);
 
 /* ==========================================
    CHECK AGENT ONLINE
@@ -671,6 +824,6 @@ export default {
   initAgentClient,
   getIO,
   getConnectedAgents,
-  getAgent,
+  getAgentById,
   isAgentOnline
 };

@@ -10,6 +10,18 @@ import path from "path";
 import { fileURLToPath } from "url";
 
 // ------------------------------------------------------------
+// PATH CONFIGURATION
+// ------------------------------------------------------------
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Load backend/.env before reading environment variables.
+dotenv.config({
+  path: path.join(__dirname, "../.env"),
+});
+
+// ------------------------------------------------------------
 // ROUTES
 // ------------------------------------------------------------
 
@@ -29,78 +41,92 @@ import * as agentBridge from "./socket/agentBridge.js";
 import { initAgentClient } from "./socket/index.js";
 
 // ------------------------------------------------------------
-// PATH CONFIGURATION
+// APPLICATION
 // ------------------------------------------------------------
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// ------------------------------------------------------------
-// ENVIRONMENT
-// ------------------------------------------------------------
-
-dotenv.config({
-  path: path.join(__dirname, "../.env"),
-});
 
 const app = express();
 const server = http.createServer(app);
 
 // ------------------------------------------------------------
-// CORS
+// CORS CONFIGURATION
 // ------------------------------------------------------------
 
-const allowedOrigins = [
+// Supports comma-separated values in FRONTEND_URL,
+// FRONTEND_ORIGIN, and FRONTEND_URLS.
+//
+// Example:
+// FRONTEND_URL=https://trust-wipe-public-demo.vercel.app
+// FRONTEND_ORIGIN=http://localhost:5173
+
+const configuredOrigins = [
   process.env.FRONTEND_URL,
   process.env.FRONTEND_ORIGIN,
-].filter(Boolean);
+  process.env.FRONTEND_URLS,
+]
+  .filter(Boolean)
+  .flatMap((value) => value.split(","))
+  .map((origin) => origin.trim().replace(/\/$/, ""))
+  .filter(Boolean);
 
-app.use(
-  cors({
-    origin(origin, callback) {
-      // Allow server-to-server / Postman / curl requests
-      if (!origin) {
-        return callback(null, true);
-      }
+// Local development and deployed frontend origins.
+const defaultOrigins = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "https://trust-wipe-public-demo.vercel.app",
+];
 
-      // If no frontend origin is configured,
-      // allow the request.
-      if (allowedOrigins.length === 0) {
-        return callback(null, true);
-      }
+const allowedOrigins = [
+  ...new Set([
+    ...defaultOrigins,
+    ...configuredOrigins,
+  ]),
+];
 
-      if (allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
+console.log("🌐 Allowed frontend origins:", allowedOrigins);
 
-      console.warn(
-        `⚠️ CORS blocked origin: ${origin}`
-      );
+const corsOptions = {
+  origin(origin, callback) {
+    // Allow requests without Origin, such as curl and server-to-server.
+    if (!origin) {
+      return callback(null, true);
+    }
 
-      return callback(
-        new Error("Not allowed by CORS")
-      );
-    },
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
 
-    credentials: true,
+    console.warn(`⚠️ CORS blocked origin: ${origin}`);
 
-    methods: [
-      "GET",
-      "POST",
-      "PUT",
-      "PATCH",
-      "DELETE",
-      "OPTIONS",
-    ],
+    return callback(new Error("Origin not allowed by CORS"));
+  },
 
-    allowedHeaders: [
-      "Content-Type",
-      "Authorization",
-      "Accept",
-      "X-Forensic-Api-Key",
-    ],
-  })
-);
+  credentials: true,
+
+  methods: [
+    "GET",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
+    "OPTIONS",
+  ],
+
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "Accept",
+    "X-Forensic-Api-Key",
+    "X-Requested-With",
+  ],
+
+  optionsSuccessStatus: 204,
+};
+
+// CORS must be registered before routes and authentication middleware.
+app.use(cors(corsOptions));
+
+// Explicitly handle browser preflight requests.
+app.options(/.*/, cors(corsOptions));
 
 // ------------------------------------------------------------
 // BODY PARSING
@@ -125,25 +151,22 @@ app.use(
 
 if (process.env.NODE_ENV !== "production") {
   app.use((req, res, next) => {
-    console.log(
-      `[API] ${req.method} ${req.originalUrl}`
-    );
-
+    console.log(`[API] ${req.method} ${req.originalUrl}`);
     next();
   });
 }
 
 // ------------------------------------------------------------
-// SOCKET.IO / AGENT
+// SOCKET.IO / TRUSTWIPE AGENT
 // ------------------------------------------------------------
 
 initAgentClient(server);
 
-// Make the TrustWipe Agent bridge available to forensic routes
+// Make the agent bridge available to forensic routes.
 app.set("agentBridge", agentBridge);
 
 console.log(
-  "🔌 Agent Bridge registered:",
+  "🔌 Agent Bridge:",
   typeof agentBridge.sendForensicTask === "function"
     ? "READY"
     : "UNAVAILABLE"
@@ -153,62 +176,23 @@ console.log(
 // API ROUTES
 // ------------------------------------------------------------
 
-app.use(
-  "/api/auth",
-  authRoutes
-);
+app.use("/api/auth", authRoutes);
 
-app.use(
-  "/api/devices",
-  deviceRoutes
-);
+app.use("/api/devices", deviceRoutes);
 
-app.use(
-  "/api/wipe",
-  wipeRoutes
-);
+app.use("/api/wipe", wipeRoutes);
 
-app.use(
-  "/api/verification",
-  verificationRoutes
-);
+app.use("/api/verification", verificationRoutes);
 
-app.use(
-  "/api/certificate",
-  certificateRoutes
-);
+app.use("/api/certificate", certificateRoutes);
 
-app.use(
-  "/api/reports",
-  reportRoutes
-);
+app.use("/api/reports", reportRoutes);
 
 // ------------------------------------------------------------
 // FORENSICS
 // ------------------------------------------------------------
-//
-// This mounts:
-//
-// GET  /api/forensic/test
-// GET  /api/forensic/status
-// GET  /api/forensic/evidence
-// POST /api/forensic/upload
-// POST /api/forensic/hash
-// POST /api/forensic/verify-integrity
-// POST /api/forensic/scan
-// POST /api/forensic/report
-//
-// etc.
-//
-// The actual forensic Python engine lives at:
-//
-// backend/forensic_recovery/
-//
 
-app.use(
-  "/api/forensic",
-  forensicRoutes
-);
+app.use("/api/forensic", forensicRoutes);
 
 // ------------------------------------------------------------
 // DOWNLOADS
@@ -228,168 +212,124 @@ app.use(
 // HEALTH CHECK
 // ------------------------------------------------------------
 
-app.get(
-  "/api/health",
-  (_req, res) => {
-    res.status(200).json({
-      success: true,
-      status: "OK",
-      application: "TrustWipe Enterprise API",
-      version: "1.0.0",
-      forensic: true,
-    });
-  }
-);
+app.get("/api/health", (_req, res) => {
+  res.status(200).json({
+    success: true,
+    status: "OK",
+    application: "TrustWipe Enterprise API",
+    version: "1.0.0",
+    forensic: true,
+  });
+});
 
 // ------------------------------------------------------------
-// FORENSIC HEALTH / DEBUG ENDPOINT
+// FORENSIC HEALTH
 // ------------------------------------------------------------
-//
-// This makes it very easy to test whether the
-// forensic router is actually mounted.
-//
-// Open:
-//
-// /api/forensic/test
-//
-// Expected:
-//
-// {
-//   success: true,
-//   message: "Forensic router is working"
-// }
 
-app.get(
-  "/api/forensic-health",
-  (_req, res) => {
-    res.status(200).json({
-      success: true,
-      service: "TrustWipe Digital Forensics",
-      mounted: true,
-      endpoint: "/api/forensic",
-    });
-  }
-);
+app.get("/api/forensic-health", (_req, res) => {
+  res.status(200).json({
+    success: true,
+    service: "TrustWipe Digital Forensics",
+    mounted: true,
+    endpoint: "/api/forensic",
+  });
+});
 
 // ------------------------------------------------------------
 // ROOT
 // ------------------------------------------------------------
 
-app.get(
-  "/",
-  (_req, res) => {
-    res.status(200).json({
-      success: true,
-      application: "TrustWipe Enterprise API",
-      version: "1.0.0",
-      services: {
-        api: true,
-        forensic: true,
-        socket: true,
-      },
-    });
-  }
-);
+app.get("/", (_req, res) => {
+  res.status(200).json({
+    success: true,
+    application: "TrustWipe Enterprise API",
+    version: "1.0.0",
+    services: {
+      api: true,
+      forensic: true,
+      socket: true,
+    },
+  });
+});
 
 // ------------------------------------------------------------
 // 404 HANDLER
 // ------------------------------------------------------------
 
-app.use(
-  (req, res) => {
-    console.warn(
-      `⚠️ 404 NOT FOUND: ${req.method} ${req.originalUrl}`
-    );
+app.use((req, res) => {
+  console.warn(
+    `⚠️ 404 NOT FOUND: ${req.method} ${req.originalUrl}`
+  );
 
-    res.status(404).json({
-      success: false,
-      code: "ROUTE_NOT_FOUND",
-      message: "Route not found",
-      path: req.originalUrl,
-    });
-  }
-);
+  res.status(404).json({
+    success: false,
+    code: "ROUTE_NOT_FOUND",
+    message: "Route not found",
+    path: req.originalUrl,
+  });
+});
 
 // ------------------------------------------------------------
 // GLOBAL ERROR HANDLER
 // ------------------------------------------------------------
 
-app.use(
-  (err, req, res, next) => {
-    console.error(
-      "❌ SERVER ERROR:",
-      err
-    );
+app.use((err, req, res, next) => {
+  console.error("❌ SERVER ERROR:", err.message || err);
 
-    if (res.headersSent) {
-      return next(err);
-    }
+  if (res.headersSent) {
+    return next(err);
+  }
 
-    res.status(
-      err.status || 500
-    ).json({
+  // CORS rejection is not an application route failure.
+  if (err.message === "Origin not allowed by CORS") {
+    return res.status(403).json({
       success: false,
-      message:
-        process.env.NODE_ENV === "production"
-          ? "Internal Server Error"
-          : err.message ||
-            "Internal Server Error",
+      code: "CORS_ORIGIN_DENIED",
+      message: "This frontend origin is not allowed.",
     });
   }
-);
+
+  res.status(err.status || 500).json({
+    success: false,
+    message:
+      process.env.NODE_ENV === "production"
+        ? "Internal Server Error"
+        : err.message || "Internal Server Error",
+  });
+});
 
 // ------------------------------------------------------------
 // DATABASE + SERVER START
 // ------------------------------------------------------------
 
-const PORT =
-  Number(process.env.PORT) || 5000;
-
-const MONGO_URI =
-  process.env.MONGO_URI;
+const PORT = Number(process.env.PORT) || 5000;
+const MONGO_URI = process.env.MONGO_URI;
 
 if (!MONGO_URI) {
-  console.error(
-    "❌ MONGO_URI is not configured."
-  );
-
+  console.error("❌ MONGO_URI is not configured.");
   process.exit(1);
 }
 
-mongoose
-  .connect(MONGO_URI)
-  .then(() => {
-    console.log(
-      "✅ MongoDB Connected"
-    );
+async function startServer() {
+  try {
+    await mongoose.connect(MONGO_URI);
 
-    server.listen(
-      PORT,
-      "0.0.0.0",
-      () => {
-        console.log(
-          `🚀 TrustWipe Server Running on port ${PORT}`
-        );
+    console.log("✅ MongoDB Connected");
 
-        console.log(
-          `🔗 Health: http://localhost:${PORT}/api/health`
-        );
-
-        console.log(
-          `🔬 Forensics: http://localhost:${PORT}/api/forensic/test`
-        );
-
-        console.log(
-          `🛡️ Forensic Health: http://localhost:${PORT}/api/forensic-health`
-        );
-      }
-    );
-  })
-  .catch((err) => {
-    console.error(
-      "❌ MongoDB Connection Error:",
-      err.message
-    );
-
+    server.listen(PORT, "0.0.0.0", () => {
+      console.log(`🚀 TrustWipe Server Running on port ${PORT}`);
+      console.log(`🔗 Health: http://localhost:${PORT}/api/health`);
+      console.log(
+        `🔬 Forensics: http://localhost:${PORT}/api/forensic/test`
+      );
+      console.log(
+        `🛡️ Forensic Health: http://localhost:${PORT}/api/forensic-health`
+      );
+    });
+  } catch (err) {
+    console.error("❌ MongoDB Connection Error:", err.message);
     process.exit(1);
-  });
+  }
+}
+
+startServer();
