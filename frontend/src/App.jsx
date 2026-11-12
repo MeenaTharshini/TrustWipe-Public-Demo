@@ -101,9 +101,9 @@ function Layout() {
               ================================================= */}
 
           <Route
-            path="/"
-            element={<Home />}
-          />
+  path="/"
+  element={<Navigate to="/dashboard" replace />}
+/>
 
 
           {/* =================================================
