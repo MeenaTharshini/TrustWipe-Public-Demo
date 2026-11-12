@@ -1,9 +1,10 @@
 
+// backend/src/routes/wipeRoutes.js
+
 import express from "express";
 
 import {
   startWipeController,
-  approveWipeController,
   getAllJobs,
   getJobById
 } from "../controllers/wipeController.js";
@@ -12,28 +13,30 @@ import authMiddleware from "../middleware/authMiddleware.js";
 
 const router = express.Router();
 
-// Create a pending wipe request.
+/**
+ * Create a pending wipe request.
+ * POST /api/wipe/start
+ */
 router.post(
   "/start",
   authMiddleware,
   startWipeController
 );
 
-// Explicit owner approval.
-router.post(
-  "/:jobId/approve",
-  authMiddleware,
-  approveWipeController
-);
-
-// Get the authenticated user's wipe jobs.
+/**
+ * Get all wipe jobs belonging to the authenticated user.
+ * GET /api/wipe
+ */
 router.get(
   "/",
   authMiddleware,
   getAllJobs
 );
 
-// Get one job belonging to the authenticated user.
+/**
+ * Get a single wipe job belonging to the authenticated user.
+ * GET /api/wipe/:jobId
+ */
 router.get(
   "/:jobId",
   authMiddleware,
