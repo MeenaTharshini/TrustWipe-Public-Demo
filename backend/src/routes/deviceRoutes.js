@@ -21,12 +21,15 @@ import authMiddleware from "../middleware/authMiddleware.js";
 
 const router = express.Router();
 
-// ------------------------------------------------------------
+// ============================================================
 // PUBLIC ROUTES
-// ------------------------------------------------------------
+// ============================================================
 
-// GET /api/devices/test-drive-route
-// Basic route availability check.
+/**
+ * GET /api/devices/test-drive-route
+ *
+ * Public route health check.
+ */
 router.get("/test-drive-route", (_req, res) => {
   return res.status(200).json({
     success: true,
@@ -34,43 +37,40 @@ router.get("/test-drive-route", (_req, res) => {
   });
 });
 
-// ------------------------------------------------------------
-// PUBLIC DEMO DRIVE DISCOVERY
-// ------------------------------------------------------------
-
-// GET /api/devices/discover
-//
-// No login required.
-// This endpoint must return simulated demo drives only.
-// It must never expose unrestricted physical-drive discovery.
-
+/**
+ * GET /api/devices/discover
+ *
+ * Public demo discovery.
+ * Must return simulated drives only.
+ * No physical agent or login should be required.
+ */
 router.get("/discover", discoverDemoDrives);
 
-// ------------------------------------------------------------
-// AUTHENTICATED REAL DRIVE DISCOVERY
-// ------------------------------------------------------------
+// ============================================================
+// AUTHENTICATED REAL DEVICE DISCOVERY
+// ============================================================
 
-// GET /api/devices/discover/private
-//
-// Requires a logged-in user.
-// Real discovery must use a trusted, authenticated agent.
-
+/**
+ * GET /api/devices/discover/private
+ *
+ * Real physical-device discovery.
+ * Requires authentication and a trusted agent.
+ */
 router.get(
   "/discover/private",
   authMiddleware,
   discoverDrives
 );
 
-// ------------------------------------------------------------
-// AUTHENTICATED AGENT-SPECIFIC DRIVE DISCOVERY
-// ------------------------------------------------------------
+// ============================================================
+// AUTHENTICATED AGENT DRIVE DISCOVERY
+// ============================================================
 
-// GET /api/devices/:agentId/drives
-//
-// Requires login.
-// The agent bridge must independently verify that the
-// requested agent is trusted and authorized for this user.
-
+/**
+ * GET /api/devices/:agentId/drives
+ *
+ * Requires authentication.
+ */
 router.get(
   "/:agentId/drives",
   authMiddleware,
@@ -86,7 +86,9 @@ router.get(
         });
       }
 
-      if (!req.user?.id) {
+      const userId = req.user?.id;
+
+      if (!userId) {
         return res.status(401).json({
           success: false,
           code: "AUTHENTICATION_REQUIRED",
@@ -107,10 +109,7 @@ router.get(
         });
       }
 
-      const result = await agentBridge.requestDriveList(
-        agentId,
-        req.user.id
-      );
+      const result = await agentBridge.requestDriveList(agentId);
 
       const drives = Array.isArray(result?.drives)
         ? result.drives
@@ -121,11 +120,9 @@ router.get(
         agentId,
         drives,
       });
+
     } catch (error) {
-      console.error(
-        "Agent drive discovery error:",
-        error
-      );
+      console.error("Agent drive discovery error:", error);
 
       const status = {
         AGENT_NOT_FOUND: 404,
@@ -136,75 +133,76 @@ router.get(
       return res.status(status).json({
         success: false,
         code: error.code || "DRIVE_DISCOVERY_ERROR",
-        message:
-          error.message || "Unable to discover drives.",
+        message: error.message || "Unable to discover drives.",
       });
     }
   }
 );
 
-// ------------------------------------------------------------
-// AUTHENTICATED DEVICE CREATION
-// ------------------------------------------------------------
+// ============================================================
+// AUTHENTICATED DEVICE MANAGEMENT
+// ============================================================
 
-// POST /api/devices
-
+/**
+ * POST /api/devices
+ *
+ * Register a real device.
+ */
 router.post(
   "/",
   authMiddleware,
   createDevice
 );
 
-// ------------------------------------------------------------
-// AUTHENTICATED DEVICE LIST
-// ------------------------------------------------------------
-
-// GET /api/devices
-
+/**
+ * GET /api/devices
+ *
+ * Get devices belonging to the authenticated user.
+ */
 router.get(
   "/",
   authMiddleware,
   getDevices
 );
 
-// ------------------------------------------------------------
-// AUTHENTICATED DEVICE BY ID
-// ------------------------------------------------------------
-
-// GET /api/devices/:id
-
+/**
+ * GET /api/devices/:id
+ *
+ * Get one device.
+ */
 router.get(
   "/:id",
   authMiddleware,
   getDeviceById
 );
 
-// ------------------------------------------------------------
-// AUTHENTICATED DEVICE UPDATE
-// ------------------------------------------------------------
-
-// PUT /api/devices/:id
-
+/**
+ * PUT /api/devices/:id
+ *
+ * Update a device.
+ */
 router.put(
   "/:id",
   authMiddleware,
   updateDevice
 );
 
-// PATCH /api/devices/:id
-
+/**
+ * PATCH /api/devices/:id
+ *
+ * Partially update a device.
+ */
 router.patch(
   "/:id",
   authMiddleware,
   updateDevice
 );
 
-// ------------------------------------------------------------
-// AUTHENTICATED DEVICE DELETE
-// ------------------------------------------------------------
-
-// DELETE /api/devices/:id
-
+/**
+ * DELETE /api/devices/:id
+ *
+ * Delete a device.
+ */
 router.delete(
   "/:id",
   authMiddleware,
