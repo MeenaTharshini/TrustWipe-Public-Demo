@@ -1,3 +1,4 @@
+
 /* ==========================================
    backend/src/socket/index.js
 ========================================== */
@@ -9,11 +10,11 @@ import {
   registerAgent,
   unregisterAgent,
   updateAgentHeartbeat,
-  resolvePendingDiscovery,
   resolveDriveDiscovery,
+  getAgentInternal,
   getAgent as getBridgeAgent,
   listAgents,
-  isAgentConnected,
+  isAgentConnected
 } from "./agentBridge.js";
 
 import WipeJob from "../models/WipeJob.js";
@@ -21,1276 +22,655 @@ import Device from "../models/Device.js";
 import Certificate from "../models/Certificate.js";
 
 import {
-  generateCertificate,
+  generateCertificate
 } from "../certificateEngine/generateCertificate.js";
 
-
-/* =====================================================
+/* ==========================================
    SOCKET INSTANCE
-===================================================== */
+========================================== */
 
 let io = null;
 
+const DEMO_AGENT_ID = process.env.TRUSTWIPE_DEMO_AGENT_ID;
 
-/* =====================================================
-   INITIALIZE SOCKET.IO
-===================================================== */
+const allowedOrigins = (
+  process.env.FRONTEND_URL ||
+  "http://localhost:5173,https://trust-wipe-public-demo.vercel.app"
+)
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
-export const initAgentClient = (
-  httpServer
-) => {
+/* ==========================================
+   HELPERS
+========================================== */
 
+const getAgentId = (data = {}) =>
+  String(data.agentId || data.deviceId || "").trim();
+
+const getRegisteredAgentForSocket = (socket) => {
+  return listAgents().find(
+    (agent) => agent.socketId === socket.id
+  ) || null;
+};
+
+const isSocketAuthorizedForAgent = (socket, agentId) => {
+  const id = String(agentId || "").trim();
+
+  if (!id) return false;
+
+  const agent = getAgentInternal(id);
+
+  return Boolean(
+    agent &&
+    agent.socketId === socket.id &&
+    agent.socket?.connected
+  );
+};
+
+const emitToAgent = (agentId, event, payload) => {
+  if (!io || !agentId) return;
+
+  io.to(`agent:${agentId}`).emit(event, payload);
+};
+
+/*
+ * Fail closed unless the database links this job's
+ * device to the agent reporting the event.
+ *
+ * This expects Device.agentId or Device.deviceId,
+ * or WipeJob.agentId, to contain the registered ID.
+ */
+const getAuthorizedJob = async (jobId, agentId) => {
+  if (!jobId || !agentId) return null;
+
+  const job = await WipeJob.findById(jobId);
+
+  if (!job) return null;
+
+  const device = await Device.findById(job.deviceId);
+
+  if (!device) return null;
+
+  const linkedAgentId = String(
+    job.agentId ||
+    device.agentId ||
+    device.deviceId ||
+    ""
+  ).trim();
+
+  if (!linkedAgentId || linkedAgentId !== String(agentId)) {
+    console.warn(
+      "Rejected job event: job/device does not belong to reporting agent."
+    );
+
+    return null;
+  }
+
+  return { job, device };
+};
+
+/* ==========================================
+   SOCKET INITIALIZATION
+========================================== */
+
+export const initAgentClient = (httpServer) => {
   if (!httpServer) {
-
     throw new Error(
       "HTTP server is required to initialize Socket.IO."
     );
-
   }
-
-
-  /*
-   * Prevent accidental duplicate initialization.
-   */
 
   if (io) {
-
-    console.warn(
-      "⚠️ Socket.IO is already initialized."
-    );
-
+    console.warn("Socket.IO is already initialized.");
     return io;
-
   }
 
-
-  /* ---------------------------------------------------
-     CREATE SOCKET.IO SERVER
-  --------------------------------------------------- */
-
-  io = new Server(
-    httpServer,
-    {
-      cors: {
-        origin: "*",
-        methods: [
-          "GET",
-          "POST",
-        ],
-      },
-
-      transports: [
-        "websocket",
-        "polling",
-      ],
-
-      pingInterval: 25000,
-
-      pingTimeout: 60000,
-    }
-  );
-
-
-  /*
-   * Store Socket.IO instance in agentBridge.
-   */
+  io = new Server(httpServer, {
+    cors: {
+      origin: allowedOrigins,
+      methods: ["GET", "POST"],
+      credentials: true
+    },
+    transports: ["websocket", "polling"],
+    pingInterval: 25000,
+    pingTimeout: 60000
+  });
 
   setSocket(io);
 
+  console.log("TrustWipe Socket.IO initialized.");
 
-  console.log(
-    "================================="
-  );
-
-  console.log(
-    " TrustWipe Socket.IO Started"
-  );
-
-  console.log(
-    "=================================");
-
-
-  /* ===================================================
+  /* ========================================
      CONNECTION
-  =================================================== */
+  ======================================== */
 
-  io.on(
-    "connection",
-    (socket) => {
+  io.on("connection", (socket) => {
+    console.log("Socket connected:", socket.id);
 
-      console.log(
-        "🟢 Socket Connected:",
-        socket.id
-      );
+    /* ======================================
+       REGISTER AGENT
+    ====================================== */
 
+    socket.on("register-agent", (agent = {}) => {
+      try {
+        const agentId = getAgentId(agent);
 
-      /* ===============================================
-         REGISTER AGENT
-      =============================================== */
-
-      socket.on(
-        "register-agent",
-        (agent = {}) => {
-
-          try {
-
-            /*
-             * Your current agent sends deviceId.
-             * Newer code may send agentId.
-             *
-             * Support both.
-             */
-
-            const deviceId =
-              String(
-                agent.deviceId ||
-                agent.agentId ||
-                ""
-              ).trim();
-
-
-            if (!deviceId) {
-
-              console.error(
-                "❌ Agent registration rejected:"
-                + " missing deviceId."
-              );
-
-
-              socket.emit(
-                "agent-registered",
-                {
-                  success: false,
-
-                  error:
-                    "Missing deviceId/agentId.",
-                }
-              );
-
-
-              return;
-
-            }
-
-
-            /*
-             * Register through agentBridge.
-             *
-             * IMPORTANT:
-             * Do not maintain another Map here.
-             */
-
-            const registeredAgent =
-              registerAgent({
-
-                ...agent,
-
-                agentId:
-                  deviceId,
-
-                deviceId,
-
-                socket,
-
-              });
-
-
-            /*
-             * Join agent-specific room.
-             */
-
-            socket.join(
-              `agent:${deviceId}`
-            );
-
-
-            console.log(
-              "✅ Agent Registered:",
-              deviceId
-            );
-
-
-            /*
-             * Notify the registering agent.
-             */
-
-            socket.emit(
-              "agent-registered",
-              {
-
-                success: true,
-
-                agentId:
-                  deviceId,
-
-                deviceId,
-
-                status:
-                  "online",
-
-              }
-            );
-
-
-            /*
-             * Notify frontend/admin clients.
-             */
-
-            io.emit(
-              "agent-status",
-              {
-
-                deviceId,
-
-                agentId:
-                  deviceId,
-
-                status:
-                  "online",
-
-                hostname:
-                  registeredAgent.hostname,
-
-                platform:
-                  registeredAgent.platform,
-
-                capabilities:
-                  registeredAgent.capabilities,
-
-              }
-            );
-
-          }
-          catch (err) {
-
-            console.error(
-              "❌ Agent registration error:",
-              err.message
-            );
-
-
-            socket.emit(
-              "agent-registered",
-              {
-
-                success: false,
-
-                error:
-                  err.message,
-
-              }
-            );
-
-          }
-
+        if (!agentId) {
+          socket.emit("agent-registered", {
+            success: false,
+            error: "Missing agentId/deviceId."
+          });
+          return;
         }
-      );
 
-
-      /* ===============================================
-         HEARTBEAT
-      =============================================== */
-
-      socket.on(
-        "heartbeat",
-        (data = {}) => {
-
-          const deviceId =
-            String(
-              data.deviceId ||
-              data.agentId ||
-              ""
-            ).trim();
-
-
-          if (!deviceId) {
-            return;
-          }
-
-
-          const updated =
-            updateAgentHeartbeat(
-              deviceId,
-              data
-            );
-
-
-          if (!updated) {
-
-            console.warn(
-              `⚠️ Heartbeat from unknown agent: ${deviceId}`
-            );
-
-            return;
-
-          }
-
-
-          /*
-           * Optional status broadcast.
-           */
-
-          io.emit(
-            "agent-status",
-            {
-
-              deviceId,
-
-              agentId:
-                deviceId,
-
-              status:
-                "online",
-
-            }
-          );
-
+        /*
+         * The configured demo agent must have a separate
+         * server-validated registration token.
+         */
+        if (
+          agentId === DEMO_AGENT_ID &&
+          !process.env.TRUSTWIPE_DEMO_AGENT_TOKEN
+        ) {
+          socket.emit("agent-registered", {
+            success: false,
+            error: "Demo agent authentication is not configured."
+          });
+          return;
         }
-      );
 
+        const registeredAgent = registerAgent({
+          ...agent,
+          agentId,
+          deviceId: agentId,
+          socket,
+          demoToken: agent.demoToken
+        });
 
-      /* ===============================================
-   DRIVE DISCOVERY
-=============================================== */
+        if (!registeredAgent) {
+          socket.emit("agent-registered", {
+            success: false,
+            error: "Agent registration failed."
+          });
+          return;
+        }
 
-socket.on(
-  "drive-list",
-  (data = {}) => {
+        socket.join(`agent:${agentId}`);
 
-    try {
+        socket.emit("agent-registered", {
+          success: true,
+          agentId,
+          deviceId: agentId,
+          status: "online"
+        });
 
-      const deviceId =
-        String(
-          data.deviceId ||
-          data.agentId ||
-          ""
-        ).trim();
+        /*
+         * Do not broadcast hostnames or capabilities to
+         * every connected client.
+         */
+        console.log("Agent registered:", agentId);
+      } catch (error) {
+        console.error("Agent registration error:", error.message);
 
-
-      console.log(
-        "📀 Drive list received from agent:",
-        deviceId || "unknown"
-      );
-
-
-      /* -------------------------------------------
-         RESOLVE REQUEST-ID BASED DISCOVERY
-      ------------------------------------------- */
-
-      if (data.requestId) {
-
-        const resolved =
-          resolveDriveDiscovery(
-            data.requestId,
-            data
-          );
-
-        console.log(
-          resolved
-            ? "✅ Drive discovery request resolved:"
-            : "⚠️ No pending drive request found:",
-          data.requestId
-        );
-
+        socket.emit("agent-registered", {
+          success: false,
+          error: "Agent registration failed."
+        });
       }
+    });
 
+    /* ======================================
+       HEARTBEAT
+    ====================================== */
 
-      /* -------------------------------------------
-         RESOLVE LEGACY USER-ID DISCOVERY
-      ------------------------------------------- */
+    socket.on("heartbeat", (data = {}) => {
+      try {
+        const agentId = getAgentId(data);
 
-      if (data.userId) {
+        if (!isSocketAuthorizedForAgent(socket, agentId)) {
+          console.warn("Rejected unauthorized heartbeat.");
+          return;
+        }
 
-        resolvePendingDiscovery(
-          data.userId,
-          data
-        );
-
+        updateAgentHeartbeat(agentId, data);
+      } catch (error) {
+        console.error("Heartbeat error:", error.message);
       }
+    });
 
+    /* ======================================
+       DRIVE DISCOVERY RESPONSE
+    ====================================== */
 
-      /* -------------------------------------------
-         LOG DISCOVERED DRIVES
-      ------------------------------------------- */
+    socket.on("drive-list", (data = {}) => {
+      try {
+        const agentId = getAgentId(data);
 
-      const drives =
-        Array.isArray(data.drives)
+        if (!isSocketAuthorizedForAgent(socket, agentId)) {
+          console.warn("Rejected unauthorized drive-list.");
+          return;
+        }
+
+        if (!data.requestId) {
+          console.warn("Drive-list response missing requestId.");
+          return;
+        }
+
+        const drives = Array.isArray(data.drives)
           ? data.drives
           : [];
 
+        const resolved = resolveDriveDiscovery(
+          data.requestId,
+          {
+            success: true,
+            agentId,
+            deviceId: agentId,
+            drives,
+            timestamp: data.timestamp || new Date().toISOString()
+          },
+          socket.id
+        );
 
-      console.log(
-        `📀 ${drives.length} drive(s) discovered`
-      );
+        console.log(
+          resolved
+            ? `Drive discovery resolved for ${agentId}.`
+            : `Unmatched drive discovery response from ${agentId}.`
+        );
 
+        /*
+         * Do not resolve discovery using data.userId.
+         * A user ID supplied by an agent event is not
+         * proof of ownership.
+         *
+         * Do not broadcast drive lists globally.
+         */
+      } catch (error) {
+        console.error("Drive-list error:", error.message);
+      }
+    });
 
-      drives.forEach(
-        (drive, index) => {
+    /* ======================================
+       WIPE PROGRESS
+    ====================================== */
 
-          console.log(
-            `   ${index + 1}.`,
-            drive.name ||
-            drive.driveLetter ||
-            drive.devicePath ||
-            drive.path ||
-            "Unknown drive"
-          );
+    socket.on("wipe-progress", async (data = {}) => {
+      try {
+        const agentId = getAgentId(data);
 
+        if (!isSocketAuthorizedForAgent(socket, agentId)) {
+          console.warn("Rejected unauthorized wipe-progress.");
+          return;
         }
-      );
 
+        const jobId = data.commandId || data.jobId;
 
-      /* -------------------------------------------
-         BROADCAST TO FRONTEND
-      ------------------------------------------- */
+        const progress = Number(data.progress);
 
-      io.emit(
-        "drive-list",
-        {
+        if (
+          !jobId ||
+          !Number.isFinite(progress) ||
+          progress < 0 ||
+          progress > 100
+        ) {
+          return;
+        }
+
+        const authorized = await getAuthorizedJob(jobId, agentId);
+
+        if (!authorized) return;
+
+        const { job } = authorized;
+
+        if (
+          job.status === "completed" ||
+          job.status === "failed"
+        ) {
+          return;
+        }
+
+        job.progress = progress;
+        job.status = "running";
+
+        job.events = job.events || [];
+        job.events.push({
+          message: data.message || "Wipe progress updated.",
+          timestamp: new Date()
+        });
+
+        await job.save();
+
+        emitToAgent(agentId, "wipe-progress", job);
+      } catch (error) {
+        console.error("Wipe-progress error:", error.message);
+      }
+    });
+
+    /* ======================================
+       WIPE COMPLETE
+    ====================================== */
+
+    socket.on("wipe-complete", async (data = {}) => {
+      try {
+        const agentId = getAgentId(data);
+
+        if (!isSocketAuthorizedForAgent(socket, agentId)) {
+          console.warn("Rejected unauthorized wipe-complete.");
+          return;
+        }
+
+        const jobId = data.commandId || data.jobId;
+
+        if (!jobId) return;
+
+        const finalStatus =
+          data.status === "completed"
+            ? "completed"
+            : data.status === "failed"
+              ? "failed"
+              : null;
+
+        if (!finalStatus) {
+          console.warn("Rejected invalid wipe completion status.");
+          return;
+        }
+
+        const authorized = await getAuthorizedJob(jobId, agentId);
+
+        if (!authorized) return;
+
+        const { job, device } = authorized;
+
+        if (
+          job.status === "completed" ||
+          job.status === "failed"
+        ) {
+          console.warn("Ignoring duplicate wipe completion:", jobId);
+          return;
+        }
+
+        job.progress =
+          finalStatus === "completed"
+            ? 100
+            : Math.min(
+                100,
+                Math.max(0, Number(data.progress) || 0)
+              );
+
+        job.status = finalStatus;
+        job.completedAt = new Date();
+
+        job.wipedFiles = data.wipedFiles;
+        job.verifiedFiles = data.verifiedFiles;
+        job.verificationFailures = data.verificationFailures;
+        job.verificationHash = data.verificationHash;
+        job.verificationEvidenceHash =
+          data.verificationEvidenceHash;
+
+        job.events = job.events || [];
+        job.events.push({
+          message: `Job ${finalStatus}`,
+          timestamp: new Date()
+        });
+
+        await job.save();
+
+        /* ----------------------------------
+           UPDATE DEVICE
+        ---------------------------------- */
+
+        const deviceStatus =
+          finalStatus === "completed"
+            ? "Completed"
+            : "Failed";
+
+        device.status = deviceStatus;
+        device.currentJobId = null;
+        device.lastJobId = job._id;
+
+        await device.save();
+
+        /* ----------------------------------
+           GENERATE CERTIFICATE
+        ---------------------------------- */
+
+        if (finalStatus === "completed") {
+          try {
+            const certificate = await Certificate.create({
+              certificateId: `TW-${Date.now()}`,
+              deviceId: device._id,
+              jobId: job._id,
+              manufacturer: device.manufacturer || "",
+              modelNumber: device.modelNumber || "",
+              owner: device.owner,
+              location: device.location || "",
+              deviceType: device.storageType || "",
+              storagePath: device.storagePath || "",
+              sanitizationStandard: "NIST SP 800-88 Rev.1",
+              algorithm: job.algorithm,
+              verificationMethod: job.verificationMethod,
+              verificationHash: job.verificationHash,
+              verificationEvidenceHash:
+                job.verificationEvidenceHash,
+              verificationStatus: "VERIFIED",
+              wipedFiles: job.wipedFiles,
+              verifiedFiles: job.verifiedFiles,
+              verificationFailures: job.verificationFailures,
+              wipeCompletedAt: job.completedAt,
+              signature: "TrustWipe Digital Signature"
+            });
+
+            const pdfPath = await generateCertificate(
+              certificate,
+              device
+            );
+
+            certificate.pdfUrl = pdfPath;
+            await certificate.save();
+
+            job.certificateId = certificate.certificateId;
+            await job.save();
+
+            console.log(
+              "Certificate generated:",
+              certificate.certificateId
+            );
+          } catch (error) {
+            console.error(
+              "Certificate generation failed:",
+              error.message
+            );
+          }
+        }
+
+        /*
+         * This room currently contains the agent socket.
+         * User dashboard notifications require a separate
+         * authenticated user room.
+         */
+        emitToAgent(agentId, "wipe-complete", job);
+
+        emitToAgent(agentId, "device-updated", {
+          deviceId: device._id,
+          status: deviceStatus,
+          jobId: job._id
+        });
+      } catch (error) {
+        console.error("Wipe-complete error:", error.message);
+      }
+    });
+
+    /* ======================================
+       FORENSIC PROGRESS
+    ====================================== */
+
+    socket.on("forensic-progress", (data = {}) => {
+      try {
+        const agentId = getAgentId(data);
+
+        if (!isSocketAuthorizedForAgent(socket, agentId)) {
+          return;
+        }
+
+        const jobId = data.jobId || data.commandId;
+        const progress = Number(data.progress);
+
+        if (
+          !jobId ||
+          !Number.isFinite(progress) ||
+          progress < 0 ||
+          progress > 100
+        ) {
+          return;
+        }
+
+        emitToAgent(agentId, "forensic-progress", {
           ...data,
+          agentId,
+          jobId,
+          progress,
+          timestamp: new Date().toISOString()
+        });
+      } catch (error) {
+        console.error("Forensic-progress error:", error.message);
+      }
+    });
 
-          deviceId,
+    /* ======================================
+       FORENSIC COMPLETE
+    ====================================== */
 
-          agentId:
-            data.agentId ||
-            deviceId,
+    socket.on("forensic-complete", (data = {}) => {
+      try {
+        const agentId = getAgentId(data);
 
-          drives,
-
-          timestamp:
-            data.timestamp ||
-            new Date().toISOString(),
+        if (!isSocketAuthorizedForAgent(socket, agentId)) {
+          return;
         }
-      );
 
-    }
-    catch (err) {
+        const jobId = data.jobId || data.commandId;
 
-      console.error(
-        "❌ drive-list handler error:",
-        err.message
-      );
+        if (!jobId) return;
 
-    }
+        emitToAgent(agentId, "forensic-complete", {
+          ...data,
+          agentId,
+          jobId,
+          status: data.status || "completed",
+          timestamp: new Date().toISOString()
+        });
+      } catch (error) {
+        console.error("Forensic-complete error:", error.message);
+      }
+    });
 
-  }
-);
+    /* ======================================
+       FORENSIC ERROR
+    ====================================== */
 
+    socket.on("forensic-error", (data = {}) => {
+      try {
+        const agentId = getAgentId(data);
 
-      /* ===============================================
-         WIPE PROGRESS
-      =============================================== */
-
-      socket.on(
-        "wipe-progress",
-        async (data = {}) => {
-
-          try {
-
-            const jobId =
-              data.commandId ||
-              data.jobId;
-
-
-            if (!jobId) {
-
-              console.warn(
-                "⚠️ wipe-progress missing jobId."
-              );
-
-              return;
-
-            }
-
-
-            const update = {
-
-              progress:
-                Number(
-                  data.progress || 0
-                ),
-
-              status:
-                "running",
-
-              $push: {
-
-                events: {
-
-                  message:
-                    data.message ||
-                    "Wipe progress updated.",
-
-                  timestamp:
-                    new Date(),
-
-                },
-
-              },
-
-            };
-
-
-            const job =
-              await WipeJob.findByIdAndUpdate(
-                jobId,
-                update,
-                {
-                  new: true,
-                }
-              );
-
-
-            /*
-             * Send progress to frontend.
-             */
-
-            io.emit(
-              "wipe-progress",
-              job || data
-            );
-
-          }
-          catch (err) {
-
-            console.error(
-              "❌ wipe-progress error:",
-              err.message
-            );
-
-          }
-
+        if (!isSocketAuthorizedForAgent(socket, agentId)) {
+          return;
         }
+
+        const jobId = data.jobId || data.commandId || null;
+
+        emitToAgent(agentId, "forensic-error", {
+          ...data,
+          agentId,
+          jobId,
+          status: "failed",
+          timestamp: new Date().toISOString()
+        });
+      } catch (error) {
+        console.error("Forensic-error error:", error.message);
+      }
+    });
+
+    /* ======================================
+       AGENT STATUS REQUEST
+    ====================================== */
+
+    socket.on("get-agent-status", () => {
+      try {
+        const agent = getRegisteredAgentForSocket(socket);
+
+        socket.emit("agent-list", agent ? [agent] : []);
+      } catch (error) {
+        console.error("Agent status error:", error.message);
+      }
+    });
+
+    /* ======================================
+       DISCONNECT
+    ====================================== */
+
+    socket.on("disconnect", (reason) => {
+      const agent = getRegisteredAgentForSocket(socket);
+
+      console.log("Socket disconnected:", socket.id, reason);
+
+      if (!agent) return;
+
+      const removed = unregisterAgent(
+        agent.agentId,
+        socket.id
       );
 
-
-      /* ===============================================
-         WIPE COMPLETE
-      =============================================== */
-
-      socket.on(
-        "wipe-complete",
-        async (data = {}) => {
-
-          try {
-
-            const jobId =
-              data.commandId ||
-              data.jobId;
-
-
-            if (!jobId) {
-
-              console.error(
-                "❌ wipe-complete missing job ID."
-              );
-
-              return;
-
-            }
-
-
-            const job =
-              await WipeJob.findByIdAndUpdate(
-
-                jobId,
-
-                {
-
-                  progress:
-                    100,
-
-                  status:
-                    data.status ||
-                    "completed",
-
-                  completedAt:
-                    new Date(),
-
-                  wipedFiles:
-                    data.wipedFiles,
-
-                  verifiedFiles:
-                    data.verifiedFiles,
-
-                  verificationFailures:
-                    data.verificationFailures,
-
-                  verificationHash:
-                    data.verificationHash,
-
-                  verificationEvidenceHash:
-                    data.verificationEvidenceHash,
-
-                  $push: {
-
-                    events: {
-
-                      message:
-                        `Job ${
-                          data.status ||
-                          "completed"
-                        }`,
-
-                      timestamp:
-                        new Date(),
-
-                    },
-
-                  },
-
-                },
-
-                {
-                  new: true,
-                }
-
-              );
-
-
-            if (!job) {
-
-              console.log(
-                "⚠️ Wipe job not found:",
-                jobId
-              );
-
-              return;
-
-            }
-
-
-            /* -------------------------------------------
-               UPDATE DEVICE
-            ------------------------------------------- */
-
-            const deviceStatus =
-              data.status === "completed"
-                ? "Completed"
-                : data.status === "failed"
-                ? "Failed"
-                : "Pending";
-
-
-            await Device.findByIdAndUpdate(
-
-              job.deviceId,
-
-              {
-
-                status:
-                  deviceStatus,
-
-                currentJobId:
-                  null,
-
-                lastJobId:
-                  job._id,
-
-              },
-
-              {
-                new: true,
-              }
-
-            );
-
-
-            /* -------------------------------------------
-               GENERATE CERTIFICATE
-            ------------------------------------------- */
-
-            if (
-              data.status === "completed"
-            ) {
-
-              try {
-
-                const device =
-                  await Device.findById(
-                    job.deviceId
-                  );
-
-
-                if (!device) {
-
-                  throw new Error(
-                    "Device not found."
-                  );
-
-                }
-
-
-                /*
-                 * Create certificate.
-                 */
-
-                const certificate =
-                  await Certificate.create({
-
-                    certificateId:
-                      `TW-${Date.now()}`,
-
-                    deviceId:
-                      device._id,
-
-                    jobId:
-                      job._id,
-
-                    manufacturer:
-                      device.manufacturer ||
-                      "",
-
-                    modelNumber:
-                      device.modelNumber ||
-                      "",
-
-                    owner:
-                      device.owner,
-
-                    location:
-                      device.location ||
-                      "",
-
-                    deviceType:
-                      device.storageType ||
-                      "",
-
-                    storagePath:
-                      device.storagePath ||
-                      "",
-
-                    sanitizationStandard:
-                      "NIST SP 800-88 Rev.1",
-
-                    algorithm:
-                      job.algorithm,
-
-                    verificationMethod:
-                      job.verificationMethod,
-
-                    verificationHash:
-                      job.verificationHash,
-
-                    verificationEvidenceHash:
-                      job.verificationEvidenceHash,
-
-                    verificationStatus:
-                      "VERIFIED",
-
-                    wipedFiles:
-                      job.wipedFiles,
-
-                    verifiedFiles:
-                      job.verifiedFiles,
-
-                    verificationFailures:
-                      job.verificationFailures,
-
-                    wipeCompletedAt:
-                      job.completedAt,
-
-                    signature:
-                      "TrustWipe Digital Signature",
-
-                  });
-
-
-                /*
-                 * Generate PDF certificate.
-                 */
-
-                const pdfPath =
-                  await generateCertificate(
-                    certificate,
-                    device
-                  );
-
-
-                /*
-                 * Save generated PDF path.
-                 */
-
-                certificate.pdfUrl =
-                  pdfPath;
-
-
-                await certificate.save();
-
-
-                /*
-                 * Link certificate to wipe job.
-                 */
-
-                job.certificateId =
-                  certificate.certificateId;
-
-
-                await job.save();
-
-
-                console.log(
-                  "📜 Certificate Generated:",
-                  certificate.certificateId
-                );
-
-              }
-              catch (err) {
-
-                /*
-                 * Certificate generation failure
-                 * should not change the already completed
-                 * wipe operation.
-                 */
-
-                console.error(
-                  "❌ Certificate Generation Failed:",
-                  err.message
-                );
-
-              }
-
-            }
-
-
-            /* -------------------------------------------
-               NOTIFY FRONTEND
-            ------------------------------------------- */
-
-            io.emit(
-              "wipe-complete",
-              job
-            );
-
-
-            io.emit(
-              "device-updated",
-              {
-
-                deviceId:
-                  job.deviceId,
-
-                status:
-                  deviceStatus,
-
-                jobId:
-                  job._id,
-
-              }
-            );
-
-          }
-          catch (err) {
-
-            console.error(
-              "❌ wipe-complete error:",
-              err.message
-            );
-
-          }
-
-        }
-      );
-
-
-      /* ===============================================
-         FORENSIC PROGRESS
-      =============================================== */
-
-      socket.on(
-        "forensic-progress",
-        async (data = {}) => {
-
-          try {
-
-            const jobId =
-              data.jobId ||
-              data.commandId;
-
-
-            if (!jobId) {
-
-              console.warn(
-                "⚠️ forensic-progress missing jobId."
-              );
-
-              return;
-
-            }
-
-
-            console.log(
-              "🔎 Forensic progress:",
-              jobId,
-              `${data.progress || 0}%`
-            );
-
-
-            /*
-             * Store progress in the ForensicJob model
-             * if it exists.
-             *
-             * Dynamic import is avoided here.
-             * The model should be imported at the top
-             * if your project contains it.
-             *
-             * For compatibility, we broadcast the
-             * progress immediately.
-             */
-
-
-            io.emit(
-              "forensic-progress",
-              {
-
-                ...data,
-
-                jobId,
-
-                timestamp:
-                  new Date().toISOString(),
-
-              }
-            );
-
-          }
-          catch (err) {
-
-            console.error(
-              "❌ forensic-progress error:",
-              err.message
-            );
-
-          }
-
-        }
-      );
-
-
-      /* ===============================================
-         FORENSIC COMPLETE
-      =============================================== */
-
-      socket.on(
-        "forensic-complete",
-        async (data = {}) => {
-
-          try {
-
-            const jobId =
-              data.jobId ||
-              data.commandId;
-
-
-            if (!jobId) {
-
-              console.warn(
-                "⚠️ forensic-complete missing jobId."
-              );
-
-              return;
-
-            }
-
-
-            console.log(
-              "✅ Forensic job completed:",
-              jobId
-            );
-
-
-            /*
-             * Broadcast complete forensic result.
-             */
-
-            io.emit(
-              "forensic-complete",
-              {
-
-                ...data,
-
-                jobId,
-
-                status:
-                  data.status ||
-                  "completed",
-
-                timestamp:
-                  new Date().toISOString(),
-
-              }
-            );
-
-          }
-          catch (err) {
-
-            console.error(
-              "❌ forensic-complete error:",
-              err.message
-            );
-
-          }
-
-        }
-      );
-
-
-      /* ===============================================
-         FORENSIC ERROR
-      =============================================== */
-
-      socket.on(
-        "forensic-error",
-        async (data = {}) => {
-
-          try {
-
-            const jobId =
-              data.jobId ||
-              data.commandId ||
-              null;
-
-
-            console.error(
-              "❌ Forensic agent error:",
-              data.error ||
-              "Unknown error"
-            );
-
-
-            /*
-             * Broadcast error to frontend.
-             */
-
-            io.emit(
-              "forensic-error",
-              {
-
-                ...data,
-
-                jobId,
-
-                status:
-                  "failed",
-
-                timestamp:
-                  new Date().toISOString(),
-
-              }
-            );
-
-          }
-          catch (err) {
-
-            console.error(
-              "❌ forensic-error handler failed:",
-              err.message
-            );
-
-          }
-
-        }
-      );
-
-
-      /* ===============================================
-         AGENT STATUS REQUEST
-      =============================================== */
-
-      socket.on(
-        "get-agent-status",
-        () => {
-
-          try {
-
-            socket.emit(
-              "agent-list",
-              listAgents()
-            );
-
-          }
-          catch (err) {
-
-            console.error(
-              "❌ Agent status request failed:",
-              err.message
-            );
-
-          }
-
-        }
-      );
-
-
-      /* ===============================================
-         DISCONNECT
-      =============================================== */
-
-      socket.on(
-        "disconnect",
-        (reason) => {
-
-          console.log(
-            "🔴 Socket Disconnected:",
-            socket.id
-          );
-
-          console.log(
-            "   Reason:",
-            reason
-          );
-
-
-          /*
-           * Find which registered agent owns this
-           * socket and remove only that connection.
-           */
-
-          const agents =
-            listAgents();
-
-
-          for (
-            const agent
-            of agents
-          ) {
-
-            if (
-              agent.socketId ===
-              socket.id
-            ) {
-
-              const removed =
-                unregisterAgent(
-                  agent.agentId,
-                  socket.id
-                );
-
-
-              if (removed) {
-
-                console.log(
-                  "🔴 Agent Disconnected:",
-                  agent.agentId
-                );
-
-
-                /*
-                 * Notify frontend.
-                 */
-
-                io.emit(
-                  "agent-status",
-                  {
-
-                    deviceId:
-                      agent.agentId,
-
-                    agentId:
-                      agent.agentId,
-
-                    status:
-                      "offline",
-
-                  }
-                );
-
-              }
-
-
-              break;
-
-            }
-
-          }
-
-        }
-      );
-
-    }
-  );
-
+      if (removed) {
+        console.log("Agent disconnected:", agent.agentId);
+      }
+    });
+  });
 
   return io;
-
 };
 
-
-/* =====================================================
-   GET SOCKET.IO INSTANCE
-===================================================== */
+/* ==========================================
+   GET SOCKET INSTANCE
+========================================== */
 
 export const getIO = () => {
-
   if (!io) {
-
     throw new Error(
       "Socket.IO has not been initialized."
     );
-
   }
 
-
   return io;
-
 };
 
-
-/* =====================================================
+/* ==========================================
    GET CONNECTED AGENTS
-===================================================== */
+========================================== */
 
-/**
- * Returns sanitized agent information.
- *
- * No raw Socket.IO socket objects are returned.
- */
+export const getConnectedAgents = () => listAgents();
 
-export const getConnectedAgents = () => {
-
-  return listAgents();
-
-};
-
-
-/* =====================================================
+/* ==========================================
    GET SINGLE AGENT
-===================================================== */
+========================================== */
 
-export const getAgent = (
-  deviceId
-) => {
+export const getAgent = (deviceId) =>
+  getBridgeAgent(deviceId);
 
-  return getBridgeAgent(
-    deviceId
-  );
-
-};
-
-
-/* =====================================================
+/* ==========================================
    CHECK AGENT ONLINE
-===================================================== */
+========================================== */
 
-export const isAgentOnline = (
-  deviceId
-) => {
+export const isAgentOnline = (deviceId) =>
+  isAgentConnected(deviceId);
 
-  return isAgentConnected(
-    deviceId
-  );
-
-};
-
-
-/* =====================================================
+/* ==========================================
    DEFAULT EXPORT
-===================================================== */
+========================================== */
 
 export default {
   initAgentClient,
   getIO,
   getConnectedAgents,
   getAgent,
-  isAgentOnline,
+  isAgentOnline
 };

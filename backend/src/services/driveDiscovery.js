@@ -1,22 +1,24 @@
 
+/* ==========================================
+   backend/src/services/driveDiscovery.js
+========================================== */
+
 import {
-  listOnlineAgents,
+  getAgentInternal,
+  isDemoAgent,
   requestDriveList,
 } from "../socket/agentBridge.js";
 
 /*
 |--------------------------------------------------------------------------
-| Find a connected agent by ID
+| Error helper
 |--------------------------------------------------------------------------
 */
-const findOnlineAgent = (agentId) => {
-  const agents = listOnlineAgents();
 
-  return agents.find(
-    (agent) =>
-      agent.agentId === agentId ||
-      agent.deviceId === agentId
-  );
+const createDiscoveryError = (message, code) => {
+  const error = new Error(message);
+  error.code = code;
+  return error;
 };
 
 /*
@@ -24,50 +26,102 @@ const findOnlineAgent = (agentId) => {
 | Request drives from a specific agent
 |--------------------------------------------------------------------------
 */
+
 export const requestDriveDiscovery = async (
   userId,
   agentId = null
 ) => {
-  const agents = listOnlineAgents();
+  let agent = null;
 
-  if (!agents.length) {
-    const error = new Error("No TrustWipe Agent Connected");
-    error.code = "AGENT_NOT_FOUND";
-    throw error;
+  /*
+   * PUBLIC DEMO DISCOVERY
+   *
+   * Only the backend-configured demo agent is permitted.
+   */
+
+  if (agentId) {
+    if (!isDemoAgent(agentId)) {
+      throw createDiscoveryError(
+        "Dedicated demo agent is unavailable.",
+        "AGENT_NOT_FOUND"
+      );
+    }
+
+    agent = getAgentInternal(agentId);
+
+    if (!agent) {
+      throw createDiscoveryError(
+        "Demo agent not found.",
+        "AGENT_NOT_FOUND"
+      );
+    }
   }
 
-  const agent = agentId
-    ? findOnlineAgent(agentId)
-    : agents.find((item) => item.userId === userId);
+  /*
+   * PRIVATE DISCOVERY
+   *
+   * Do not select an arbitrary agent from listOnlineAgents().
+   * A verified user-to-agent ownership mapping is required.
+   *
+   * This implementation expects the authenticated user's
+   * ID to be stored on the internal agent record as userId.
+   */
 
-  if (!agent) {
-    const error = new Error(
-      "No authorized online TrustWipe Agent found"
+  else {
+    if (!userId) {
+      throw createDiscoveryError(
+        "Authenticated user ID is required.",
+        "UNAUTHORIZED"
+      );
+    }
+
+    const { getConnectedAgents } = await import(
+      "../socket/agentBridge.js"
     );
-    error.code = "AGENT_NOT_FOUND";
-    throw error;
+
+    agent = getConnectedAgents().find(
+      (item) =>
+        item.userId === String(userId) &&
+        item.status === "online" &&
+        item.socket?.connected
+    );
+
+    if (!agent) {
+      throw createDiscoveryError(
+        "No authorized online TrustWipe Agent found.",
+        "AGENT_NOT_FOUND"
+      );
+    }
   }
+
+  /*
+   * Request drive information.
+   */
 
   const result = await requestDriveList(
     agent.agentId,
     userId
   );
 
-  if (!result || !Array.isArray(result.drives)) {
-    const error = new Error(
-      "Invalid drive list received from TrustWipe Agent"
+  if (
+    !result ||
+    !Array.isArray(result.drives)
+  ) {
+    throw createDiscoveryError(
+      "Invalid drive list received from TrustWipe Agent.",
+      "INVALID_DRIVE_RESPONSE"
     );
-    error.code = "INVALID_DRIVE_RESPONSE";
-    throw error;
   }
+
+  /*
+   * Normalize discovered drives.
+   */
 
   const devices = result.drives.map((drive) => ({
     ...drive,
-    agentId:
-      result.deviceId ||
-      result.agentId ||
-      agent.deviceId ||
-      agent.agentId,
+
+    agentId: agent.agentId,
+
     discoveredAt: new Date(),
   }));
 
@@ -80,20 +134,34 @@ export const requestDriveDiscovery = async (
 
 /*
 |--------------------------------------------------------------------------
-| Authenticated discovery controller
+| AUTHENTICATED DISCOVERY CONTROLLER
 |--------------------------------------------------------------------------
 */
+
 export const discoverDrives = async (req, res) => {
   try {
+    if (!req.user?.id) {
+      return res.status(401).json({
+        success: false,
+        code: "UNAUTHORIZED",
+        message: "Authentication required.",
+      });
+    }
+
     const result = await requestDriveDiscovery(
-      req.user.id
+      String(req.user.id)
     );
 
     return res.status(200).json(result);
+
   } catch (err) {
-    console.error("Drive Discovery Error:", err);
+    console.error(
+      "Drive Discovery Error:",
+      err.message
+    );
 
     const status = {
+      UNAUTHORIZED: 401,
       AGENT_NOT_FOUND: 404,
       AGENT_OFFLINE: 503,
       DRIVE_DISCOVERY_TIMEOUT: 504,
@@ -110,15 +178,23 @@ export const discoverDrives = async (req, res) => {
 
 /*
 |--------------------------------------------------------------------------
-| Public demo discovery controller
+| PUBLIC DEMO DISCOVERY CONTROLLER
 |--------------------------------------------------------------------------
-| This must be restricted to a dedicated demo agent.
-| Configure TRUSTWIPE_DEMO_AGENT_ID on the backend.
+|
+| Requires:
+| TRUSTWIPE_DEMO_AGENT_ID
+|
+| The corresponding agent must be registered as a dedicated
+| demo agent by trusted server-side registration logic.
+|
 |--------------------------------------------------------------------------
 */
+
 export const discoverDemoDrives = async (req, res) => {
   try {
-    const demoAgentId = process.env.TRUSTWIPE_DEMO_AGENT_ID;
+    const demoAgentId = String(
+      process.env.TRUSTWIPE_DEMO_AGENT_ID || ""
+    ).trim();
 
     if (!demoAgentId) {
       return res.status(503).json({
@@ -136,10 +212,13 @@ export const discoverDemoDrives = async (req, res) => {
     return res.status(200).json(result);
 
   } catch (err) {
-    console.error("Demo Drive Discovery Error:", err);
+    console.error(
+      "Demo Drive Discovery Error:",
+      err.message
+    );
 
     const status = {
-      AGENT_NOT_FOUND: 404,
+      AGENT_NOT_FOUND: 503,
       AGENT_OFFLINE: 503,
       DRIVE_DISCOVERY_TIMEOUT: 504,
       INVALID_DRIVE_RESPONSE: 502,

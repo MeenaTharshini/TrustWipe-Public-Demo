@@ -1,3 +1,4 @@
+
 /* ==========================================
    backend/src/socket/agentBridge.js
 ========================================== */
@@ -14,11 +15,30 @@
  * 6. Handle job cancellation
  * 7. Track heartbeat / connection status
  *
- * IMPORTANT:
- * This bridge sends only predefined Socket.IO events.
- * It must NEVER be used as a remote shell.
+ * Security:
+ * - Never expose raw sockets through public agent lists.
+ * - Never trust agent-supplied demo metadata.
+ * - Associate private agents with users only through
+ *   trusted server-side authentication.
+ * - Validate the responding socket for drive discovery.
+ * - Never use this bridge as a remote shell.
  */
 
+import crypto from "node:crypto";
+
+/* =====================================================
+   CONFIGURATION
+===================================================== */
+
+const DEMO_AGENT_ID =
+  String(process.env.TRUSTWIPE_DEMO_AGENT_ID || "").trim();
+
+const DEMO_AGENT_TOKEN =
+  String(process.env.TRUSTWIPE_DEMO_AGENT_TOKEN || "").trim();
+
+const DISCOVERY_TIMEOUT_MS = 30000;
+const DEFAULT_HEARTBEAT_TIMEOUT_MS = 90000;
+const CLEANUP_INTERVAL_MS = 30000;
 
 /* =====================================================
    SOCKET INSTANCE
@@ -26,81 +46,116 @@
 
 let ioInstance = null;
 
-
 /* =====================================================
    CONNECTED AGENTS
 ===================================================== */
 
 const connectedAgents = new Map();
+
+/**
+ * Raw internal records. Use only inside trusted
+ * backend services. Never send these to clients.
+ */
 export const getConnectedAgents = () => {
   return Array.from(connectedAgents.values());
 };
 
 /* =====================================================
-   LEGACY PENDING DISCOVERY
+   PENDING REQUESTS
 ===================================================== */
 
 const pendingDiscovery = new Map();
-
-
-/* =====================================================
-   DRIVE DISCOVERY REQUESTS
-===================================================== */
-
 const pendingDriveDiscovery = new Map();
 
+/* =====================================================
+   ERROR HELPER
+===================================================== */
+
+const createError = (message, code) => {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+};
 
 /* =====================================================
    SOCKET INSTANCE MANAGEMENT
 ===================================================== */
 
-/**
- * Store Socket.IO instance.
- */
 export const setSocket = (io) => {
-
   if (!io) {
-    throw new Error(
-      "Invalid Socket.IO instance."
-    );
+    throw new Error("Invalid Socket.IO instance.");
   }
 
   ioInstance = io;
 
-  console.log(
-    "✅ Socket.IO instance registered in agentBridge."
-  );
-
+  console.log("Socket.IO instance registered in agentBridge.");
 };
 
-
-/**
- * Get Socket.IO instance.
- */
 export const getSocket = () => {
-
   if (!ioInstance) {
-
-    throw new Error(
-      "Socket.IO has not been initialized."
-    );
-
+    throw new Error("Socket.IO has not been initialized.");
   }
 
   return ioInstance;
-
 };
 
+export const isSocketInitialized = () => {
+  return ioInstance !== null;
+};
+
+/* =====================================================
+   DEMO AGENT VALIDATION
+===================================================== */
 
 /**
- * Check whether Socket.IO is initialized.
+ * A demo agent must have:
+ * - The configured demo agent ID.
+ * - A matching server-side registration token.
+ *
+ * The token is checked during registration and is
+ * never stored in the agent record.
+ *
+ * Do not use agent.metadata.demo as proof of trust.
  */
-export const isSocketInitialized = () => {
+const isValidDemoRegistration = (agentId, suppliedToken) => {
+  if (!DEMO_AGENT_ID || !DEMO_AGENT_TOKEN) {
+    return false;
+  }
 
-  return ioInstance !== null;
+  if (agentId !== DEMO_AGENT_ID) {
+    return false;
+  }
 
+  if (typeof suppliedToken !== "string") {
+    return false;
+  }
+
+  const expected = Buffer.from(DEMO_AGENT_TOKEN);
+  const supplied = Buffer.from(suppliedToken);
+
+  if (expected.length !== supplied.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(expected, supplied);
 };
 
+/**
+ * Check whether the configured demo agent is online
+ * and was registered using the trusted demo token.
+ */
+export const isDemoAgent = (agentId) => {
+  const id = String(agentId || "").trim();
+  const agent = connectedAgents.get(id);
+
+  return Boolean(
+    agent &&
+    agent.demoTrusted === true &&
+    id === DEMO_AGENT_ID &&
+    agent.status === "online" &&
+    agent.socket?.connected
+  );
+};
 
 /* =====================================================
    AGENT REGISTRATION
@@ -108,121 +163,160 @@ export const isSocketInitialized = () => {
 
 /**
  * Register a TrustWipe Agent.
+ *
+ * IMPORTANT:
+ * ownerUserId must only be assigned by trusted backend
+ * authentication code. Never copy it directly from an
+ * unauthenticated socket registration payload.
+ *
+ * demoToken is checked but never stored.
  */
 export const registerAgent = (agent = {}) => {
-
   const agentId = String(
-    agent.agentId ||
-    agent.deviceId ||
-    ""
+    agent.agentId || agent.deviceId || ""
   ).trim();
 
-
   if (!agentId) {
-
-    throw new Error(
-      "Agent registration failed: missing agentId."
+    throw createError(
+      "Agent registration failed: missing agentId.",
+      "MISSING_AGENT_ID"
     );
-
   }
-
 
   if (!agent.socket) {
-
-    throw new Error(
-      "Agent registration failed: missing socket."
+    throw createError(
+      "Agent registration failed: missing socket.",
+      "MISSING_AGENT_SOCKET"
     );
-
   }
-
 
   const now = new Date();
+  const existing = connectedAgents.get(agentId);
 
-  const existing =
-    connectedAgents.get(agentId);
+  const demoTrusted = isValidDemoRegistration(
+    agentId,
+    agent.demoToken
+  );
 
-
+  /*
+   * Preserve an existing trusted owner association
+   * across reconnects. Do not accept ownerUserId from
+   * an ordinary agent registration payload.
+   */
   const agentRecord = {
-
     agentId,
 
-    deviceId:
-      agent.deviceId ||
-      agentId,
+    deviceId: String(agent.deviceId || agentId),
 
-    socketId:
-      agent.socket.id,
+    socketId: agent.socket.id,
 
-    socket:
-      agent.socket,
+    socket: agent.socket,
 
-    hostname:
-      agent.hostname ||
-      null,
+    hostname: agent.hostname || null,
 
-    platform:
-      agent.platform ||
-      null,
+    platform: agent.platform || null,
 
-    arch:
-      agent.arch ||
-      agent.architecture ||
-      null,
+    arch: agent.arch || agent.architecture || null,
 
-    username:
-      agent.username ||
-      null,
+    username: agent.username || null,
 
-    capabilities:
-      Array.isArray(agent.capabilities)
-        ? [...agent.capabilities]
-        : [],
+    capabilities: Array.isArray(agent.capabilities)
+      ? [...agent.capabilities]
+      : [],
 
-    connectedAt:
-      agent.connectedAt ||
-      existing?.connectedAt ||
-      now,
+    connectedAt: existing?.connectedAt || now,
 
-    lastHeartbeat:
-      now,
+    lastHeartbeat: now,
 
-    status:
-      "online",
+    status: "online",
 
+    /*
+     * Do not trust metadata.demo.
+     * Metadata is retained for internal diagnostics only.
+     */
     metadata:
-      agent.metadata ||
-      {},
+      agent.metadata && typeof agent.metadata === "object"
+        ? { ...agent.metadata, demo: undefined }
+        : {},
 
+    demoTrusted,
+
+    ownerUserId: existing?.ownerUserId || null
   };
 
+  connectedAgents.set(agentId, agentRecord);
 
-  connectedAgents.set(
-    agentId,
-    agentRecord
+  console.log(
+    existing
+      ? `Agent reconnected: ${agentId}`
+      : `Agent registered: ${agentId}`
   );
 
-
-  if (existing) {
-
-    console.log(
-      `🔄 Agent reconnected: ${agentId}`
-    );
-
-  } else {
-
-    console.log(
-      `🟢 Agent registered: ${agentId}`
-    );
-
-  }
-
-
-  return sanitizeAgentRecord(
-    agentRecord
-  );
-
+  return sanitizeAgentRecord(agentRecord);
 };
 
+/* =====================================================
+   TRUSTED USER-AGENT ASSOCIATION
+===================================================== */
+
+/**
+ * Associate an agent with a user.
+ *
+ * Call this only from trusted backend code after
+ * authenticating the agent and verifying ownership.
+ *
+ * Do not expose this function through an unauthenticated
+ * socket event or public HTTP endpoint.
+ */
+export const associateAgentWithUser = (agentId, userId) => {
+  const id = String(agentId || "").trim();
+  const owner = String(userId || "").trim();
+
+  if (!id || !owner) {
+    throw createError(
+      "Agent ID and user ID are required.",
+      "INVALID_AGENT_OWNERSHIP"
+    );
+  }
+
+  const agent = connectedAgents.get(id);
+
+  if (!agent) {
+    throw createError(
+      `Agent not found: ${id}`,
+      "AGENT_NOT_FOUND"
+    );
+  }
+
+  agent.ownerUserId = owner;
+
+  connectedAgents.set(id, agent);
+
+  return true;
+};
+
+/**
+ * Find an online agent belonging to a user.
+ */
+export const findAgentForUser = (userId) => {
+  const owner = String(userId || "").trim();
+
+  if (!owner) {
+    return null;
+  }
+
+  for (const agent of connectedAgents.values()) {
+    if (
+      agent.ownerUserId === owner &&
+      agent.status === "online" &&
+      agent.socket?.connected
+    ) {
+      return agent;
+    }
+  }
+
+  return null;
+};
 
 /* =====================================================
    AGENT UNREGISTRATION
@@ -231,1566 +325,661 @@ export const registerAgent = (agent = {}) => {
 /**
  * Remove an agent.
  *
- * socketId is optional.
- * If supplied, an old socket cannot remove
- * a newer connection.
+ * If socketId is supplied, an older socket cannot
+ * remove a newer connection.
  */
-export const unregisterAgent = (
-  agentId,
-  socketId = null
-) => {
-
-  const id =
-    String(agentId || "").trim();
-
+export const unregisterAgent = (agentId, socketId = null) => {
+  const id = String(agentId || "").trim();
 
   if (!id) {
     return false;
   }
 
-
-  const agent =
-    connectedAgents.get(id);
-
+  const agent = connectedAgents.get(id);
 
   if (!agent) {
     return false;
   }
 
-
-  if (
-    socketId &&
-    agent.socketId !== socketId
-  ) {
-
+  if (socketId && agent.socketId !== socketId) {
     return false;
-
   }
-
 
   connectedAgents.delete(id);
 
+  /*
+   * Reject pending requests associated with this agent.
+   */
+  for (const [requestId, pending] of pendingDriveDiscovery.entries()) {
+    if (pending.agentId === id) {
+      clearTimeout(pending.timeout);
+      pendingDriveDiscovery.delete(requestId);
 
-  console.log(
-    `🔴 Agent unregistered: ${id}`
-  );
+      pending.reject(
+        createError(
+          "Agent disconnected during drive discovery.",
+          "AGENT_DISCONNECTED"
+        )
+      );
+    }
+  }
 
+  console.log(`Agent unregistered: ${id}`);
 
   return true;
-
 };
-
 
 /* =====================================================
    AGENT LOOKUP
 ===================================================== */
 
+export const getAgent = (agentId) => {
+  const id = String(agentId || "").trim();
+  const agent = connectedAgents.get(id);
+
+  return agent ? sanitizeAgentRecord(agent) : null;
+};
+
 /**
- * Get sanitized agent information.
+ * Internal lookup. Contains the actual socket.
+ * Never return this object through an API response.
  */
-export const getAgent = (
-  agentId
-) => {
-
-  const id =
-    String(agentId || "").trim();
-
+export const getAgentInternal = (agentId) => {
+  const id = String(agentId || "").trim();
 
   if (!id) {
     return null;
   }
 
-
-  const agent =
-    connectedAgents.get(id);
-
-
-  if (!agent) {
-    return null;
-  }
-
-
-  return sanitizeAgentRecord(
-    agent
-  );
-
+  return connectedAgents.get(id) || null;
 };
-
-
-/**
- * Get internal agent record.
- *
- * IMPORTANT:
- * This contains the actual Socket.IO socket.
- */
-export const getAgentInternal = (
-  agentId
-) => {
-
-  const id =
-    String(agentId || "").trim();
-
-
-  if (!id) {
-    return null;
-  }
-
-
-  return (
-    connectedAgents.get(id) ||
-    null
-  );
-
-};
-
 
 /* =====================================================
    AGENT CONNECTION STATUS
 ===================================================== */
 
-/**
- * Check whether a specific agent is online.
- */
-export const isAgentConnected = (
-  agentId
-) => {
+export const isAgentConnected = (agentId) => {
+  const agent = getAgentInternal(agentId);
 
-  const agent =
-    getAgentInternal(agentId);
-
-
-  if (!agent) {
-    return false;
-  }
-
-
-  if (
-    agent.status !== "online"
-  ) {
-
-    return false;
-
-  }
-
-
-  if (
-    !agent.socket ||
-    !agent.socket.connected
-  ) {
-
-    return false;
-
-  }
-
-
-  return true;
-
+  return Boolean(
+    agent &&
+    agent.status === "online" &&
+    agent.socket?.connected
+  );
 };
 
-
-/**
- * Get detailed agent status.
- */
-export const getAgentStatus = (
-  agentId
-) => {
-
-  const agent =
-    getAgentInternal(agentId);
-
+export const getAgentStatus = (agentId) => {
+  const agent = getAgentInternal(agentId);
 
   if (!agent) {
-
     return {
-
       agentId,
-
       connected: false,
-
-      status: "offline",
-
+      status: "offline"
     };
-
   }
-
 
   return {
-
-    agentId:
-      agent.agentId,
-
-    deviceId:
-      agent.deviceId,
-
-    hostname:
-      agent.hostname,
-
-    platform:
-      agent.platform,
-
-    arch:
-      agent.arch,
-
-    username:
-      agent.username,
-
-    capabilities:
-      Array.isArray(agent.capabilities)
-        ? [...agent.capabilities]
-        : [],
-
-    connected:
-      isAgentConnected(agentId),
-
-    status:
-      isAgentConnected(agentId)
-        ? "online"
-        : "offline",
-
-    connectedAt:
-      agent.connectedAt,
-
-    lastHeartbeat:
-      agent.lastHeartbeat,
-
+    agentId: agent.agentId,
+    deviceId: agent.deviceId,
+    hostname: agent.hostname,
+    platform: agent.platform,
+    arch: agent.arch,
+    username: agent.username,
+    capabilities: [...agent.capabilities],
+    connected: isAgentConnected(agentId),
+    status: isAgentConnected(agentId) ? "online" : "offline",
+    connectedAt: agent.connectedAt,
+    lastHeartbeat: agent.lastHeartbeat
   };
-
 };
-
 
 /* =====================================================
    HEARTBEAT
 ===================================================== */
 
-/**
- * Update agent heartbeat.
- */
-export const updateAgentHeartbeat = (
-  agentId,
-  data = {}
-) => {
-
-  const id =
-    String(agentId || "").trim();
-
+export const updateAgentHeartbeat = (agentId, data = {}) => {
+  const id = String(agentId || "").trim();
 
   if (!id) {
     return false;
   }
 
-
-  const agent =
-    connectedAgents.get(id);
-
+  const agent = connectedAgents.get(id);
 
   if (!agent) {
-
-    console.warn(
-      `⚠️ Heartbeat received from unknown agent: ${id}`
-    );
-
+    console.warn(`Heartbeat from unknown agent: ${id}`);
     return false;
-
   }
 
-
-  agent.lastHeartbeat =
-    new Date();
-
-
-  agent.status =
-    "online";
-
+  agent.lastHeartbeat = new Date();
+  agent.status = "online";
 
   if (data.hostname) {
-
-    agent.hostname =
-      data.hostname;
-
+    agent.hostname = data.hostname;
   }
-
 
   if (data.platform) {
-
-    agent.platform =
-      data.platform;
-
+    agent.platform = data.platform;
   }
 
-
-  if (
-    data.arch ||
-    data.architecture
-  ) {
-
-    agent.arch =
-      data.arch ||
-      data.architecture;
-
+  if (data.arch || data.architecture) {
+    agent.arch = data.arch || data.architecture;
   }
 
-
-  if (
-    data.username
-  ) {
-
-    agent.username =
-      data.username;
-
+  if (data.username) {
+    agent.username = data.username;
   }
 
-
-  if (
-    Array.isArray(
-      data.capabilities
-    )
-  ) {
-
-    agent.capabilities =
-      [...data.capabilities];
-
+  if (Array.isArray(data.capabilities)) {
+    agent.capabilities = [...data.capabilities];
   }
 
-
-  connectedAgents.set(
-    id,
-    agent
-  );
-
+  connectedAgents.set(id, agent);
 
   return true;
-
 };
-
 
 /* =====================================================
    AGENT LIST
 ===================================================== */
 
-/**
- * Return all agents.
- */
 export const listAgents = () => {
-
-  return Array.from(
-    connectedAgents.values()
-  ).map(
+  return Array.from(connectedAgents.values()).map(
     sanitizeAgentRecord
   );
-
 };
 
-
-/**
- * Return online agents only.
- */
 export const listOnlineAgents = () => {
-
-  return Array.from(
-    connectedAgents.values()
-  )
-
+  return Array.from(connectedAgents.values())
     .filter(
       (agent) =>
-
         agent.status === "online" &&
-
-        agent.socket &&
-
-        agent.socket.connected
+        agent.socket?.connected
     )
-
-    .map(
-      sanitizeAgentRecord
-    );
-
+    .map(sanitizeAgentRecord);
 };
 
-
-/**
- * Number of registered agents.
- */
 export const getAgentCount = () => {
-
   return connectedAgents.size;
-
 };
-
 
 /* =====================================================
    AGENT CAPABILITY CHECK
 ===================================================== */
 
-/**
- * Check whether an agent supports a capability.
- */
-export const hasAgentCapability = (
-  agentId,
-  capability
-) => {
-
-  const agent =
-    getAgentInternal(agentId);
-
+export const hasAgentCapability = (agentId, capability) => {
+  const agent = getAgentInternal(agentId);
 
   if (!agent) {
     return false;
   }
 
-
-  const requested =
-    String(
-      capability || ""
-    )
-      .trim()
-      .toUpperCase();
-
+  const requested = String(capability || "")
+    .trim()
+    .toUpperCase();
 
   if (!requested) {
     return false;
   }
 
-
   return (
-
-    Array.isArray(
-      agent.capabilities
-    ) &&
-
-    agent.capabilities
-      .map(
-        (item) =>
-          String(item)
-            .trim()
-            .toUpperCase()
-      )
-      .includes(
-        requested
-      )
-
+    Array.isArray(agent.capabilities) &&
+    agent.capabilities.some(
+      (item) =>
+        String(item).trim().toUpperCase() === requested
+    )
   );
-
 };
 
-
-/**
- * Alias for compatibility.
- */
-export const agentHasCapability = (
-  agentId,
-  capability
-) => {
-
-  return hasAgentCapability(
-    agentId,
-    capability
-  );
-
+export const agentHasCapability = (agentId, capability) => {
+  return hasAgentCapability(agentId, capability);
 };
 
+/* =====================================================
+   SHARED AGENT VALIDATION
+===================================================== */
+
+const getConnectedAgentOrThrow = (agentId) => {
+  const agent = getAgentInternal(agentId);
+
+  if (!agent) {
+    throw createError(
+      `Agent not found: ${agentId}`,
+      "AGENT_NOT_FOUND"
+    );
+  }
+
+  if (!agent.socket?.connected || agent.status !== "online") {
+    throw createError(
+      `Agent is not connected: ${agentId}`,
+      "AGENT_OFFLINE"
+    );
+  }
+
+  return agent;
+};
+
+const validateCapability = (agent, capability) => {
+  /*
+   * Preserve the previous behavior:
+   * enforce only when capabilities were advertised.
+   */
+  if (
+    Array.isArray(agent.capabilities) &&
+    agent.capabilities.length > 0 &&
+    !hasAgentCapability(agent.agentId, capability)
+  ) {
+    throw createError(
+      `Agent does not support ${capability}: ${agent.agentId}`,
+      "CAPABILITY_NOT_SUPPORTED"
+    );
+  }
+};
 
 /* =====================================================
    FORENSIC TASK DISPATCH
 ===================================================== */
 
-/**
- * Send a predefined forensic task.
- *
- * Event:
- *   start-forensic
- */
-export const sendForensicTask = (
-  agentId,
-  job = {}
-) => {
+export const sendForensicTask = (agentId, job = {}) => {
+  const agent = getConnectedAgentOrThrow(agentId);
 
-  const agent =
-    getAgentInternal(agentId);
-
-
-  if (!agent) {
-
-    const error =
-      new Error(
-        `Agent not found: ${agentId}`
-      );
-
-    error.code =
-      "AGENT_NOT_FOUND";
-
-    throw error;
-
-  }
-
-
-  if (
-    !agent.socket ||
-    !agent.socket.connected
-  ) {
-
-    const error =
-      new Error(
-        `Agent is not connected: ${agentId}`
-      );
-
-    error.code =
-      "AGENT_OFFLINE";
-
-    throw error;
-
-  }
-
-
-  /*
-   * Only enforce capability validation
-   * when capabilities were actually supplied.
-   */
-  if (
-
-    Array.isArray(
-      agent.capabilities
-    ) &&
-
-    agent.capabilities.length > 0 &&
-
-    !hasAgentCapability(
-      agentId,
-      "FORENSIC_SCAN"
-    )
-
-  ) {
-
-    const error =
-      new Error(
-        `Agent does not support FORENSIC_SCAN: ${agentId}`
-      );
-
-    error.code =
-      "CAPABILITY_NOT_SUPPORTED";
-
-    throw error;
-
-  }
-
+  validateCapability(agent, "FORENSIC_SCAN");
 
   const task = {
-
     ...job,
-
     agentId,
-
-    deviceId:
-      job.deviceId ||
-      agent.deviceId,
-
-    operation:
-      "FORENSIC_SCAN",
-
-    dispatchedAt:
-      new Date().toISOString(),
-
+    deviceId: job.deviceId || agent.deviceId,
+    operation: "FORENSIC_SCAN",
+    dispatchedAt: new Date().toISOString()
   };
 
+  agent.socket.emit("start-forensic", task);
 
-  agent.socket.emit(
-    "start-forensic",
-    task
-  );
-
-
-  console.log(
-    `🔎 Forensic task dispatched to agent: ${agentId}`
-  );
-
-
-  console.log(
-    `   Job ID: ${
-      job.jobId ||
-      "unknown"
-    }`
-  );
-
+  console.log(`Forensic task dispatched: ${agentId}`);
 
   return {
-
     success: true,
-
     sent: true,
-
     agentId,
-
-    jobId:
-      job.jobId ||
-      null,
-
+    jobId: job.jobId || null
   };
-
 };
-
 
 /* =====================================================
    FORENSIC CANCELLATION
 ===================================================== */
 
-/**
- * Cancel forensic job.
- *
- * Event:
- *   cancel-forensic
- */
-export const sendForensicCancel = (
-  agentId,
-  jobId
-) => {
-
-  const agent =
-    getAgentInternal(agentId);
-
-
-  if (!agent) {
-
-    const error =
-      new Error(
-        `Agent not found: ${agentId}`
-      );
-
-    error.code =
-      "AGENT_NOT_FOUND";
-
-    throw error;
-
-  }
-
-
-  if (
-    !agent.socket ||
-    !agent.socket.connected
-  ) {
-
-    const error =
-      new Error(
-        `Agent is offline: ${agentId}`
-      );
-
-    error.code =
-      "AGENT_OFFLINE";
-
-    throw error;
-
-  }
-
+export const sendForensicCancel = (agentId, jobId) => {
+  const agent = getConnectedAgentOrThrow(agentId);
 
   if (!jobId) {
-
-    const error =
-      new Error(
-        "Missing forensic jobId."
-      );
-
-    error.code =
-      "MISSING_JOB_ID";
-
-    throw error;
-
+    throw createError(
+      "Missing forensic jobId.",
+      "MISSING_JOB_ID"
+    );
   }
 
-
-  agent.socket.emit(
-    "cancel-forensic",
-    {
-
-      jobId,
-
-      agentId,
-
-      requestedAt:
-        new Date().toISOString(),
-
-    }
-  );
-
-
-  console.log(
-    `⛔ Forensic cancellation sent: ${jobId}`
-  );
-
+  agent.socket.emit("cancel-forensic", {
+    jobId,
+    agentId,
+    requestedAt: new Date().toISOString()
+  });
 
   return {
-
     success: true,
-
     sent: true,
-
     agentId,
-
-    jobId,
-
+    jobId
   };
-
 };
-
 
 /* =====================================================
    WIPE TASK DISPATCH
 ===================================================== */
 
-/**
- * Send a predefined wipe task.
- *
- * Event:
- *   start-wipe
- */
-export const sendWipeTask = (
-  agentId,
-  job = {}
-) => {
+export const sendWipeTask = (agentId, job = {}) => {
+  const agent = getConnectedAgentOrThrow(agentId);
 
-  const agent =
-    getAgentInternal(agentId);
-
-
-  if (!agent) {
-
-    const error =
-      new Error(
-        `Agent not found: ${agentId}`
-      );
-
-    error.code =
-      "AGENT_NOT_FOUND";
-
-    throw error;
-
-  }
-
-
-  if (
-    !agent.socket ||
-    !agent.socket.connected
-  ) {
-
-    const error =
-      new Error(
-        `Agent is not connected: ${agentId}`
-      );
-
-    error.code =
-      "AGENT_OFFLINE";
-
-    throw error;
-
-  }
-
-
-  /*
-   * Only enforce capability validation
-   * when the agent has advertised capabilities.
-   */
-  if (
-
-    Array.isArray(
-      agent.capabilities
-    ) &&
-
-    agent.capabilities.length > 0 &&
-
-    !hasAgentCapability(
-      agentId,
-      "WIPE"
-    )
-
-  ) {
-
-    const error =
-      new Error(
-        `Agent does not support WIPE: ${agentId}`
-      );
-
-    error.code =
-      "CAPABILITY_NOT_SUPPORTED";
-
-    throw error;
-
-  }
-
+  validateCapability(agent, "WIPE");
 
   const task = {
-
     ...job,
-
     agentId,
-
-    deviceId:
-      job.deviceId ||
-      agent.deviceId,
-
-    operation:
-      "WIPE",
-
-    dispatchedAt:
-      new Date().toISOString(),
-
+    deviceId: job.deviceId || agent.deviceId,
+    operation: "WIPE",
+    dispatchedAt: new Date().toISOString()
   };
 
+  agent.socket.emit("start-wipe", task);
 
-  agent.socket.emit(
-    "start-wipe",
-    task
-  );
-
-
-  console.log(
-    `🧹 Wipe task dispatched to agent: ${agentId}`
-  );
-
-
-  console.log(
-    `   Job ID: ${
-      job.jobId ||
-      job.commandId ||
-      "unknown"
-    }`
-  );
-
+  console.log(`Wipe task dispatched: ${agentId}`);
 
   return {
-
     success: true,
-
     sent: true,
-
     agentId,
-
-    jobId:
-      job.jobId ||
-      job.commandId ||
-      null,
-
+    jobId: job.jobId || job.commandId || null
   };
-
 };
-
 
 /* =====================================================
    WIPE CANCELLATION
 ===================================================== */
 
-/**
- * Cancel wipe job.
- *
- * Event:
- *   cancel-wipe
- */
-export const sendWipeCancel = (
-  agentId,
-  jobId
-) => {
-
-  const agent =
-    getAgentInternal(agentId);
-
-
-  if (!agent) {
-
-    const error =
-      new Error(
-        `Agent not found: ${agentId}`
-      );
-
-    error.code =
-      "AGENT_NOT_FOUND";
-
-    throw error;
-
-  }
-
-
-  if (
-    !agent.socket ||
-    !agent.socket.connected
-  ) {
-
-    const error =
-      new Error(
-        `Agent is offline: ${agentId}`
-      );
-
-    error.code =
-      "AGENT_OFFLINE";
-
-    throw error;
-
-  }
-
+export const sendWipeCancel = (agentId, jobId) => {
+  const agent = getConnectedAgentOrThrow(agentId);
 
   if (!jobId) {
-
-    const error =
-      new Error(
-        "Missing wipe jobId."
-      );
-
-    error.code =
-      "MISSING_JOB_ID";
-
-    throw error;
-
+    throw createError(
+      "Missing wipe jobId.",
+      "MISSING_JOB_ID"
+    );
   }
 
-
-  agent.socket.emit(
-    "cancel-wipe",
-    {
-
-      jobId,
-
-      commandId:
-        jobId,
-
-      agentId,
-
-      requestedAt:
-        new Date().toISOString(),
-
-    }
-  );
-
-
-  console.log(
-    `⛔ Wipe cancellation sent: ${jobId}`
-  );
-
+  agent.socket.emit("cancel-wipe", {
+    jobId,
+    commandId: jobId,
+    agentId,
+    requestedAt: new Date().toISOString()
+  });
 
   return {
-
     success: true,
-
     sent: true,
-
     agentId,
-
-    jobId,
-
+    jobId
   };
-
 };
 
-
 /* =====================================================
-   DRIVE DISCOVERY
+   DRIVE DISCOVERY REQUEST
 ===================================================== */
 
 /**
- * Request physical drive information
- * from a connected TrustWipe Agent.
+ * Ask one connected agent to discover its drives.
  *
- * Flow:
- *
- * Backend
- *   ↓
- * discover-drives
- *   ↓
- * Agent
- *   ↓
- * drive-list
- *   ↓
- * resolveDriveDiscovery()
+ * The returned Promise resolves only when the expected
+ * agent socket responds with the matching request ID.
  */
-export const requestDriveList = (
-  agentId,
-  userId = null
-) => {
+export const requestDriveList = (agentId, userId = null) => {
+  const agent = getConnectedAgentOrThrow(agentId);
 
-  const agent =
-    getAgentInternal(agentId);
+  return new Promise((resolve, reject) => {
+    const requestId =
+      `DRIVE-${Date.now()}-${crypto.randomUUID()}`;
 
+    const timeout = setTimeout(() => {
+      pendingDriveDiscovery.delete(requestId);
 
-  if (!agent) {
-
-    const error =
-      new Error(
-        `Agent not found: ${agentId}`
+      reject(
+        createError(
+          "Timed out waiting for drive information from TrustWipe Agent.",
+          "DRIVE_DISCOVERY_TIMEOUT"
+        )
       );
+    }, DISCOVERY_TIMEOUT_MS);
 
-    error.code =
-      "AGENT_NOT_FOUND";
+    pendingDriveDiscovery.set(requestId, {
+      resolve,
+      reject,
+      timeout,
+      agentId: agent.agentId,
+      socketId: agent.socketId,
+      userId
+    });
 
-    throw error;
-
-  }
-
-
-  if (
-    !agent.socket ||
-    !agent.socket.connected
-  ) {
-
-    const error =
-      new Error(
-        `Agent is not connected: ${agentId}`
-      );
-
-    error.code =
-      "AGENT_OFFLINE";
-
-    throw error;
-
-  }
-
-
-  return new Promise(
-    (resolve, reject) => {
-
-      const requestId =
-        `DRIVE-${Date.now()}-${Math.random()
-          .toString(36)
-          .slice(2, 8)}`;
-
-
-      const timeout =
-        setTimeout(
-          () => {
-
-            pendingDriveDiscovery.delete(
-              requestId
-            );
-
-
-            const error =
-              new Error(
-                "Timed out waiting for drive information from TrustWipe Agent."
-              );
-
-
-            error.code =
-              "DRIVE_DISCOVERY_TIMEOUT";
-
-
-            reject(error);
-
-          },
-          30000
-        );
-
-
-      pendingDriveDiscovery.set(
+    try {
+      agent.socket.emit("discover-drives", {
         requestId,
-        {
-
-          resolve,
-
-          reject,
-
-          timeout,
-
-          agentId,
-
-          userId,
-
-        }
-      );
-
+        agentId: agent.agentId,
+        deviceId: agent.deviceId,
+        userId
+      });
 
       console.log(
-        `📀 Drive discovery requested from agent: ${agentId}`
+        `Drive discovery requested from agent: ${agent.agentId}`
       );
+    } catch (error) {
+      clearTimeout(timeout);
+      pendingDriveDiscovery.delete(requestId);
 
-
-      console.log(
-        `   Request ID: ${requestId}`
+      reject(
+        createError(
+          "Could not send drive discovery request.",
+          "DRIVE_DISCOVERY_SEND_FAILED"
+        )
       );
-
-
-      agent.socket.emit(
-        "discover-drives",
-        {
-
-          requestId,
-
-          agentId,
-
-          deviceId:
-            agent.deviceId,
-
-          userId,
-
-        }
-      );
-
     }
-  );
-
+  });
 };
-
 
 /* =====================================================
    RESOLVE DRIVE DISCOVERY
 ===================================================== */
 
 /**
- * Called when the Agent sends:
+ * Called by socket/index.js when an agent sends drive-list.
  *
- * drive-list
+ * IMPORTANT:
+ * Pass the actual responding socket.id as the third
+ * argument. Do not trust socketId from the event payload.
  */
 export const resolveDriveDiscovery = (
   requestId,
-  data = {}
+  data = {},
+  respondingSocketId = null
 ) => {
-
-  const id =
-    String(
-      requestId || ""
-    ).trim();
-
+  const id = String(requestId || "").trim();
 
   if (!id) {
     return false;
   }
 
-
-  const pending =
-    pendingDriveDiscovery.get(
-      id
-    );
-
+  const pending = pendingDriveDiscovery.get(id);
 
   if (!pending) {
+    console.warn(`No pending drive discovery request: ${id}`);
+    return false;
+  }
 
+  /*
+   * Reject responses that do not originate from the
+   * exact socket that received the discovery request.
+   */
+  if (
+    !respondingSocketId ||
+    respondingSocketId !== pending.socketId
+  ) {
     console.warn(
-      `⚠️ No pending drive discovery request: ${id}`
+      `Rejected drive-list response from unexpected socket: ${id}`
     );
 
     return false;
-
   }
 
+  clearTimeout(pending.timeout);
+  pendingDriveDiscovery.delete(id);
 
-  clearTimeout(
-    pending.timeout
-  );
+  pending.resolve(data);
 
-
-  pendingDriveDiscovery.delete(
-    id
-  );
-
-
-  pending.resolve(
-    data
-  );
-
-
-  console.log(
-    `✅ Drive discovery request resolved: ${id}`
-  );
-
+  console.log(`Drive discovery resolved: ${id}`);
 
   return true;
-
 };
-
 
 /* =====================================================
    LEGACY DISCOVERY SYSTEM
 ===================================================== */
 
-/**
- * Register legacy discovery callback.
- */
-export const addPendingDiscovery = (
-  userId,
-  callback
-) => {
+export const addPendingDiscovery = (userId, callback) => {
+  const id = String(userId || "").trim();
 
-  const id =
-    String(
-      userId || ""
-    ).trim();
-
-
-  if (
-    !id ||
-    typeof callback !==
-      "function"
-  ) {
-
+  if (!id || typeof callback !== "function") {
     throw new Error(
       "Invalid pending discovery registration."
     );
-
   }
 
-
-  pendingDiscovery.set(
-    id,
-    callback
-  );
-
+  pendingDiscovery.set(id, callback);
 
   return true;
-
 };
 
-
-/**
- * Resolve legacy discovery callback.
- */
-export const resolvePendingDiscovery = (
-  userId,
-  data
-) => {
-
-  const id =
-    String(
-      userId || ""
-    ).trim();
-
-
-  const callback =
-    pendingDiscovery.get(
-      id
-    );
-
+export const resolvePendingDiscovery = (userId, data) => {
+  const id = String(userId || "").trim();
+  const callback = pendingDiscovery.get(id);
 
   if (!callback) {
-
-    console.warn(
-      `⚠️ No pending discovery found for userId: ${id}`
-    );
-
+    console.warn(`No pending discovery for userId: ${id}`);
     return false;
-
   }
-
 
   try {
-
     callback(data);
-
-  }
-  catch (err) {
-
+  } catch (error) {
     console.error(
-      "❌ Discovery callback error:",
-      err.message
+      "Discovery callback error:",
+      error.message
     );
-
   }
 
-
-  pendingDiscovery.delete(
-    id
-  );
-
+  pendingDiscovery.delete(id);
 
   return true;
-
 };
 
+export const removePendingDiscovery = (userId) => {
+  const id = String(userId || "").trim();
 
-/**
- * Remove legacy discovery request.
- */
-export const removePendingDiscovery = (
-  userId
-) => {
-
-  const id =
-    String(
-      userId || ""
-    ).trim();
-
-
-  return pendingDiscovery.delete(
-    id
-  );
-
+  return pendingDiscovery.delete(id);
 };
 
-
-/**
- * List legacy pending discoveries.
- */
 export const listPendingDiscovery = () => {
-
-  return Array.from(
-    pendingDiscovery.keys()
-  );
-
+  return Array.from(pendingDiscovery.keys());
 };
-
 
 /* =====================================================
    STALE AGENT CLEANUP
 ===================================================== */
 
-/**
- * Remove stale/offline agents.
- *
- * Default heartbeat timeout:
- * 90 seconds.
- */
 export const cleanupStaleAgents = (
-  timeoutMs = 90000
+  timeoutMs = DEFAULT_HEARTBEAT_TIMEOUT_MS
 ) => {
-
-  const now =
-    Date.now();
-
-
+  const now = Date.now();
   let removed = 0;
 
+  for (const [agentId, agent] of connectedAgents.entries()) {
+    const lastHeartbeat = agent.lastHeartbeat
+      ? new Date(agent.lastHeartbeat).getTime()
+      : 0;
 
-  for (
-    const [
-      agentId,
-      agent
-    ]
-    of connectedAgents.entries()
-  ) {
-
-    const lastHeartbeat =
-      agent.lastHeartbeat
-        ? new Date(
-            agent.lastHeartbeat
-          ).getTime()
-        : 0;
-
-
-    const socketConnected =
-      Boolean(
-        agent.socket &&
-        agent.socket.connected
-      );
-
+    const socketConnected = Boolean(agent.socket?.connected);
 
     const stale =
       !socketConnected ||
       !lastHeartbeat ||
-      (
-        now -
-        lastHeartbeat >
-        timeoutMs
-      );
-
+      now - lastHeartbeat > timeoutMs;
 
     if (stale) {
-
-      connectedAgents.delete(
-        agentId
-      );
-
-
-      console.log(
-        `🧹 Removed stale agent: ${agentId}`
-      );
-
-
+      unregisterAgent(agentId, agent.socketId);
       removed++;
-
     }
-
   }
 
-
   return removed;
-
 };
-
 
 /* =====================================================
    AGENT SNAPSHOT
 ===================================================== */
 
-/**
- * Get complete bridge status.
- */
 export const getAgentSnapshot = () => {
-
   return {
-
-    initialized:
-      isSocketInitialized(),
-
-    totalAgents:
-      connectedAgents.size,
-
-    onlineAgents:
-      listOnlineAgents().length,
-
-    pendingDiscoveries:
-      pendingDiscovery.size,
-
-    pendingDriveDiscoveries:
-      pendingDriveDiscovery.size,
-
-    agents:
-      listAgents(),
-
+    initialized: isSocketInitialized(),
+    totalAgents: connectedAgents.size,
+    onlineAgents: listOnlineAgents().length,
+    pendingDiscoveries: pendingDiscovery.size,
+    pendingDriveDiscoveries: pendingDriveDiscovery.size,
+    agents: listAgents()
   };
-
 };
-
 
 /* =====================================================
    SANITIZE AGENT
 ===================================================== */
 
 /**
- * Never expose the raw Socket.IO socket
- * outside internal bridge logic.
+ * Never expose sockets, registration tokens,
+ * ownership data, or internal metadata.
  */
-const sanitizeAgentRecord = (
-  agent
-) => {
-
+const sanitizeAgentRecord = (agent) => {
   if (!agent) {
     return null;
   }
 
-
   return {
-
-    agentId:
-      agent.agentId,
-
-    deviceId:
-      agent.deviceId,
-
-    socketId:
-      agent.socketId,
-
-    hostname:
-      agent.hostname,
-
-    platform:
-      agent.platform,
-
-    arch:
-      agent.arch,
-
-    username:
-      agent.username,
-
-    capabilities:
-      Array.isArray(
-        agent.capabilities
-      )
-        ? [...agent.capabilities]
-        : [],
-
-    connectedAt:
-      agent.connectedAt,
-
-    lastHeartbeat:
-      agent.lastHeartbeat,
-
-    status:
-      agent.status,
-
+    agentId: agent.agentId,
+    deviceId: agent.deviceId,
+    socketId: agent.socketId,
+    hostname: agent.hostname,
+    platform: agent.platform,
+    arch: agent.arch,
+    username: agent.username,
+    capabilities: Array.isArray(agent.capabilities)
+      ? [...agent.capabilities]
+      : [],
+    connectedAt: agent.connectedAt,
+    lastHeartbeat: agent.lastHeartbeat,
+    status: agent.status
   };
-
 };
-
 
 /* =====================================================
    PERIODIC CLEANUP
 ===================================================== */
 
-const CLEANUP_INTERVAL =
-  30000;
+const cleanupTimer = setInterval(() => {
+  try {
+    cleanupStaleAgents();
+  } catch (error) {
+    console.error(
+      "Agent cleanup error:",
+      error.message
+    );
+  }
+}, CLEANUP_INTERVAL_MS);
 
-
-const cleanupTimer =
-  setInterval(
-    () => {
-
-      try {
-
-        cleanupStaleAgents();
-
-      }
-      catch (err) {
-
-        console.error(
-          "❌ Agent cleanup error:",
-          err.message
-        );
-
-      }
-
-    },
-    CLEANUP_INTERVAL
-  );
-
-
-/**
- * Do not let the timer alone keep
- * the Node.js process alive.
- */
-if (
-  cleanupTimer &&
-  typeof cleanupTimer.unref ===
-    "function"
-) {
-
+if (typeof cleanupTimer.unref === "function") {
   cleanupTimer.unref();
-
 }
-
 
 /* =====================================================
    BRIDGE STATUS
 ===================================================== */
 
-/**
- * Check whether the bridge is ready.
- */
 export const isBridgeReady = () => {
-
-  return (
-    ioInstance !== null
-  );
-
+  return ioInstance !== null;
 };
 
-
-/**
- * Get bridge information.
- */
 export const getBridgeStatus = () => {
-
   return {
-
-    ready:
-      ioInstance !== null,
-
-    connectedAgents:
-      connectedAgents.size,
-
-    pendingDiscovery:
-      pendingDiscovery.size,
-
-    pendingDriveDiscovery:
-      pendingDriveDiscovery.size,
-
+    ready: ioInstance !== null,
+    connectedAgents: connectedAgents.size,
+    pendingDiscovery: pendingDiscovery.size,
+    pendingDriveDiscovery: pendingDriveDiscovery.size
   };
-
 };
-
 
 /* =====================================================
    DEFAULT EXPORT
 ===================================================== */
 
 export default {
-
-  /* Socket */
   setSocket,
   getSocket,
   isSocketInitialized,
 
-  /* Agents */
   registerAgent,
   unregisterAgent,
   getAgent,
@@ -1800,38 +989,34 @@ export default {
   listAgents,
   listOnlineAgents,
   getAgentCount,
+  getConnectedAgents,
 
-  /* Heartbeat */
+  associateAgentWithUser,
+  findAgentForUser,
+  isDemoAgent,
+
   updateAgentHeartbeat,
 
-  /* Capabilities */
   hasAgentCapability,
   agentHasCapability,
 
-  /* Forensics */
   sendForensicTask,
   sendForensicCancel,
 
-  /* Wipe */
   sendWipeTask,
   sendWipeCancel,
 
-  /* Drive discovery */
   requestDriveList,
   resolveDriveDiscovery,
 
-  /* Legacy discovery */
   addPendingDiscovery,
   resolvePendingDiscovery,
   removePendingDiscovery,
   listPendingDiscovery,
 
-  /* Maintenance */
   cleanupStaleAgents,
 
-  /* Monitoring */
   getAgentSnapshot,
   isBridgeReady,
-  getBridgeStatus,
-
+  getBridgeStatus
 };
