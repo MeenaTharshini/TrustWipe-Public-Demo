@@ -12,15 +12,10 @@ import {
 // =========================================================
 
 import Sidebar from "./components/Sidebar";
-import PrivateRoute from "./components/PrivateRoute";
 
 // =========================================================
 // PAGES
 // =========================================================
-
-import Home from "./pages/Home";
-import Login from "./pages/Login";
-import Register from "./pages/Register";
 
 import Dashboard from "./pages/Dashboard";
 import Devices from "./pages/Devices";
@@ -39,7 +34,6 @@ import VerifyCertificate from "./pages/VerifyCertificate";
 
 import "./App.css";
 
-
 // =========================================================
 // APPLICATION LAYOUT
 // =========================================================
@@ -47,23 +41,16 @@ import "./App.css";
 function Layout() {
   const location = useLocation();
 
-  /*
-   * Routes that should NOT show the authenticated
-   * dashboard sidebar.
-   */
+  // Routes that should not display the dashboard sidebar
   const publicRoutes = [
     "/",
-    "/login",
-    "/register",
     "/services",
     "/about",
     "/verify",
     "/verify-certificate",
   ];
 
-  /*
-   * /verify/:id is also public.
-   */
+  // Certificate verification with an ID is also public
   const isVerifyRoute =
     location.pathname.startsWith("/verify/");
 
@@ -71,20 +58,14 @@ function Layout() {
     publicRoutes.includes(location.pathname) ||
     isVerifyRoute;
 
-
   return (
     <div className="app-layout">
 
-      {/* =====================================================
-          SIDEBAR
-          ===================================================== */}
+      {/* SIDEBAR */}
 
       {!hideSidebar && <Sidebar />}
 
-
-      {/* =====================================================
-          MAIN CONTENT
-          ===================================================== */}
+      {/* MAIN CONTENT */}
 
       <main
         className={
@@ -97,14 +78,13 @@ function Layout() {
         <Routes>
 
           {/* =================================================
-              PUBLIC LANDING PAGE
+              HOME - DIRECT DASHBOARD REDIRECT
               ================================================= */}
 
           <Route
-  path="/"
-  element={<Navigate to="/dashboard" replace />}
-/>
-
+            path="/"
+            element={<Navigate to="/dashboard" replace />}
+          />
 
           {/* =================================================
               PUBLIC INFORMATION PAGES
@@ -120,9 +100,8 @@ function Layout() {
             element={<About />}
           />
 
-
           {/* =================================================
-              CERTIFICATE VERIFICATION
+              PUBLIC CERTIFICATE VERIFICATION
               ================================================= */}
 
           <Route
@@ -135,126 +114,69 @@ function Layout() {
             element={<VerifyCertificate />}
           />
 
-          {/* Backward compatibility */}
           <Route
             path="/verify-certificate"
-            element={
-              <Navigate
-                to="/verify"
-                replace
-              />
-            }
+            element={<Navigate to="/verify" replace />}
           />
-
 
           {/* =================================================
-              AUTHENTICATION
-              ================================================= */}
-
-          <Route
-            path="/login"
-            element={<Login />}
-          />
-
-          <Route
-            path="/register"
-            element={<Register />}
-          />
-
-
-          {/* =================================================
-              PROTECTED DASHBOARD
+              PUBLIC DASHBOARD
               ================================================= */}
 
           <Route
             path="/dashboard"
-            element={
-              <PrivateRoute>
-                <Dashboard />
-              </PrivateRoute>
-            }
+            element={<Dashboard />}
           />
 
-          {/* Optional device-specific dashboard */}
           <Route
             path="/dashboard/:id"
-            element={
-              <PrivateRoute>
-                <Dashboard />
-              </PrivateRoute>
-            }
+            element={<Dashboard />}
           />
 
-
           {/* =================================================
-              DEVICES
+              PUBLIC DEVICE MANAGEMENT DEMO
               ================================================= */}
 
           <Route
             path="/devices"
-            element={
-              <PrivateRoute>
-                <Devices />
-              </PrivateRoute>
-            }
+            element={<Devices />}
           />
 
-
           {/* =================================================
-              WIPE VERIFICATION
+              PUBLIC WIPE VERIFICATION DEMO
               ================================================= */}
 
           <Route
             path="/verification"
-            element={
-              <PrivateRoute>
-                <Verification />
-              </PrivateRoute>
-            }
+            element={<Verification />}
           />
 
-
           {/* =================================================
-              CERTIFICATES
+              PUBLIC CERTIFICATES
               ================================================= */}
 
           <Route
             path="/certificates"
-            element={
-              <PrivateRoute>
-                <Certificates />
-              </PrivateRoute>
-            }
+            element={<Certificates />}
           />
 
-
           {/* =================================================
-              REPORTS
+              PUBLIC REPORTS
               ================================================= */}
 
           <Route
             path="/reports"
-            element={
-              <PrivateRoute>
-                <Reports />
-              </PrivateRoute>
-            }
+            element={<Reports />}
           />
 
-
           {/* =================================================
-              FORENSIC RECOVERY
+              PUBLIC FORENSIC OVERVIEW
               ================================================= */}
 
           <Route
             path="/forensics"
-            element={
-              <PrivateRoute>
-                <Forensics />
-              </PrivateRoute>
-            }
+            element={<Forensics />}
           />
-
 
           {/* =================================================
               LEGACY WIPE JOB ROUTE
@@ -262,28 +184,18 @@ function Layout() {
 
           <Route
             path="/wipe-jobs"
-            element={
-              <PrivateRoute>
-                <Navigate
-                  to="/dashboard"
-                  replace
-                />
-              </PrivateRoute>
-            }
+            element={<Navigate to="/dashboard" replace />}
           />
 
-
           {/* =================================================
-              404
+              404 PAGE
               ================================================= */}
 
           <Route
             path="*"
             element={
               <div className="not-found">
-
                 <h1>404</h1>
-
                 <h2>Page Not Found</h2>
 
                 <p>
@@ -293,13 +205,12 @@ function Layout() {
 
                 <button
                   className="btn btn-primary"
-                  onClick={() =>
-                    window.history.back()
-                  }
+                  onClick={() => {
+                    window.location.href = "/dashboard";
+                  }}
                 >
-                  Go Back
+                  Go to Dashboard
                 </button>
-
               </div>
             }
           />
@@ -307,11 +218,9 @@ function Layout() {
         </Routes>
 
       </main>
-
     </div>
   );
 }
-
 
 // =========================================================
 // APP
