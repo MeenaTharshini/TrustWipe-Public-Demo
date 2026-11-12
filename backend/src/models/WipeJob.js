@@ -1,3 +1,4 @@
+
 import mongoose from "mongoose";
 
 const wipeJobSchema = new mongoose.Schema(
@@ -6,24 +7,65 @@ const wipeJobSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "Device",
       required: true,
+      index: true
     },
 
     initiatedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
-      default: null,
+      default: null
+    },
+
+    // Agent assigned to execute this specific job.
+    agentId: {
+      type: String,
+      required: true,
+      index: true
     },
 
     algorithm: {
       type: String,
-      default: "NIST SP 800-88 Clear",
+      default: "NIST SP 800-88 Clear"
+    },
+
+    // Owner approval must be explicitly recorded.
+    authorization: {
+      authorizationId: {
+        type: String,
+        default: ""
+      },
+
+      approved: {
+        type: Boolean,
+        default: false
+      },
+
+      approvedAt: {
+        type: Date,
+        default: null
+      },
+
+      expiresAt: {
+        type: Date,
+        default: null
+      },
+
+      nonceHash: {
+        type: String,
+        default: ""
+      },
+
+      consumedAt: {
+        type: Date,
+        default: null
+      }
     },
 
     progress: {
       type: Number,
       default: 0,
       min: 0,
-      max: 100,
+      max: 100
     },
 
     status: {
@@ -32,110 +74,107 @@ const wipeJobSchema = new mongoose.Schema(
         "pending",
         "running",
         "completed",
-        "failed",
+        "failed"
       ],
-      default: "running",
+      default: "pending"
     },
 
     totalFiles: {
       type: Number,
-      default: 0,
+      default: 0
     },
 
     wipedFiles: {
       type: Number,
-      default: 0,
+      default: 0
     },
 
     verificationHash: {
       type: String,
-      default: "",
+      default: ""
     },
 
     verificationStatus: {
       type: String,
-      enum: [
-        "Pending",
-        "VERIFIED",
-        "FAILED",
-      ],
-      default: "Pending",
+      enum: ["Pending", "VERIFIED", "FAILED"],
+      default: "Pending"
     },
 
     verificationMethod: {
       type: String,
-      default:
-        "Post-Wipe Content Validation",
+      default: "Post-Wipe Content Validation"
     },
 
     verificationBlocksChecked: {
       type: Number,
-      default: 0,
+      default: 0
     },
 
     verificationResult: {
       type: String,
-      default: "",
+      default: ""
     },
+
     verificationEvidenceHash: {
-  type: String,
-  default: "",
-},
+      type: String,
+      default: ""
+    },
 
-verificationFailures: {
-  type: Number,
-  default: 0,
-},
+    verificationFailures: {
+      type: Number,
+      default: 0
+    },
 
-verifiedFiles: {
-  type: Number,
-  default: 0,
-},
+    verifiedFiles: {
+      type: Number,
+      default: 0
+    },
+
     certificateId: {
       type: String,
-      default: "",
+      default: ""
     },
 
     events: [
       {
         message: {
           type: String,
-          required: true,
+          required: true
         },
 
         timestamp: {
           type: Date,
-          default: Date.now,
-        },
-      },
+          default: Date.now
+        }
+      }
     ],
 
     failureReason: {
       type: String,
-      default: "",
+      default: ""
     },
 
     startedAt: {
       type: Date,
-      default: Date.now,
+      default: null
     },
 
     completedAt: {
       type: Date,
-      default: null,
+      default: null
     },
 
     duration: {
       type: Number,
-      default: 0,
-    },
+      default: 0
+    }
   },
   {
-    timestamps: true,
+    timestamps: true
   }
 );
 
-export default mongoose.model(
-  "WipeJob",
-  wipeJobSchema
-);
+wipeJobSchema.index({ deviceId: 1, status: 1 });
+wipeJobSchema.index({ "authorization.authorizationId": 1 });
+
+export default mongoose.model("WipeJob", wipeJobSchema);
